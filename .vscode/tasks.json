@@ -1,0 +1,84 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ESP-IDF: Full Clean",
+      "type": "shell",
+      "command": "rm -rf build",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/usr/bin/zsh",
+          "args": [
+            "-lc"
+          ]
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Reconfigure",
+      "type": "shell",
+      "command": "source /home/phat/.espressif/v6.0/esp-idf/export.sh && idf.py -B build reconfigure",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/usr/bin/zsh",
+          "args": [
+            "-lc"
+          ]
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Build",
+      "type": "shell",
+      "command": "source /home/phat/.espressif/v6.0/esp-idf/export.sh && idf.py -B build build",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/usr/bin/zsh",
+          "args": [
+            "-lc"
+          ]
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Flash",
+      "type": "shell",
+      "command": "setopt local_options null_glob && ports=(/dev/ttyUSB* /dev/ttyACM*) && if (( ${#ports[@]} == 0 )); then echo 'Khong tim thay cong serial ESP32. Hay cam lai cap USB/data va kiem tra driver.'; exit 1; fi && source /home/phat/.espressif/v6.0/esp-idf/export.sh && idf.py -B build -p ${ports[1]} flash",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/usr/bin/zsh",
+          "args": [
+            "-lc"
+          ]
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Monitor",
+      "type": "shell",
+      "command": "setopt local_options null_glob && ports=(/dev/ttyUSB* /dev/ttyACM*) && if (( ${#ports[@]} == 0 )); then echo 'Khong tim thay cong serial ESP32. Hay cam lai cap USB/data va kiem tra driver.'; exit 1; fi && source /home/phat/.espressif/v6.0/esp-idf/export.sh && idf.py -B build -p ${ports[1]} monitor",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "/usr/bin/zsh",
+          "args": [
+            "-lc"
+          ]
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

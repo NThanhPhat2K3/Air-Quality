@@ -48,16 +48,16 @@
 
 #define DEG_TO_RAD 0.01745329252f
 #define RGB565(r, g, b)                                                        \
-  (uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))
+  (uint16_t)((((r)&0xF8) << 8) | (((g)&0xFC) << 3) | ((b) >> 3))
 // 1 = use hybrid runtime UI (black background + data cards).
 #define SHOW_BITMAP_UI 1
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "Hao Hao"
+#define WIFI_SSID "PQ"
 #endif
 
 #ifndef WIFI_PASS
-#define WIFI_PASS "hoanhao159"
+#define WIFI_PASS "99999999"
 #endif
 
 #define WIFI_MAXIMUM_RETRY 10
@@ -78,7 +78,9 @@ typedef struct {
 typedef struct {
   struct tm clock;
   int aqi;
-  int co2_ppm;
+  int eco2_ppm;
+  int tvoc_ppb;
+  int ens_validity;
   int temp_tenths_c;
   int humidity_pct;
 } dashboard_state_t;
@@ -568,6 +570,35 @@ static void fb_fill_circle(int cx, int cy, int radius, uint16_t color) {
   }
 }
 
+static void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
+                             uint16_t color) {
+  int min_x = x0;
+  int max_x = x0;
+  int min_y = y0;
+  int max_y = y0;
+
+  if (x1 < min_x) min_x = x1;
+  if (x2 < min_x) min_x = x2;
+  if (x1 > max_x) max_x = x1;
+  if (x2 > max_x) max_x = x2;
+  if (y1 < min_y) min_y = y1;
+  if (y2 < min_y) min_y = y2;
+  if (y1 > max_y) max_y = y1;
+  if (y2 > max_y) max_y = y2;
+
+  for (int y = min_y; y <= max_y; ++y) {
+    for (int x = min_x; x <= max_x; ++x) {
+      int w0 = (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0);
+      int w1 = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+      int w2 = (x0 - x2) * (y - y2) - (y0 - y2) * (x - x2);
+      if ((w0 >= 0 && w1 >= 0 && w2 >= 0) ||
+          (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+        fb_draw_pixel(x, y, color);
+      }
+    }
+  }
+}
+
 static const uint8_t *font_lookup(char c) {
   for (size_t i = 0; i < sizeof(kFont3x5) / sizeof(kFont3x5[0]); ++i) {
     if (kFont3x5[i].c == c) {
@@ -600,6 +631,22 @@ static void fb_draw_text(int x, int y, const char *text, uint16_t color,
   for (int i = 0; i < len; ++i) {
     fb_draw_char(x + i * 4 * scale, y, text[i], color, scale);
   }
+}
+
+static void fb_draw_text_shadow(int x, int y, const char *text, uint16_t color,
+                                uint16_t shadow_color, int scale) {
+  fb_draw_text(x + 1, y + 1, text, shadow_color, scale);
+  fb_draw_text(x, y, text, color, scale);
+}
+
+static void fb_draw_text_centered(int center_x, int y, const char *text,
+                                  uint16_t color, int scale) {
+  fb_draw_text(center_x - text_width(text, scale) / 2, y, text, color, scale);
+}
+
+static void fb_draw_text_right(int right_x, int y, const char *text,
+                               uint16_t color, int scale) {
+  fb_draw_text(right_x - text_width(text, scale), y, text, color, scale);
 }
 
 static void fb_draw_arc_segment(int cx, int cy, int inner_r, int outer_r,
@@ -659,6 +706,19 @@ static const char *aqi_label(int aqi) {
   return "ALERT";
 }
 
+static const char *ens160_validity_label(int validity) {
+  switch (validity) {
+  case 0:
+    return "READY";
+  case 1:
+    return "WARMUP";
+  case 2:
+    return "STARTUP";
+  default:
+    return "CHECK";
+  }
+}
+
 static void aqi_subtext(int aqi, const char **line1, const char **line2) {
   if (aqi <= 2) {
     *line1 = "SAFE AIR";
@@ -710,58 +770,71 @@ static void draw_metric_card(int x, int y, int w, int h, const char *label,
   }
 }
 
-static void draw_hybrid_metric_card(int x, const char *label, const char *value,
-                                    const char *unit, int unit_scale,
+static void draw_hybrid_metric_card(int x, int w, const char *label,
+                                    const char *value, const char *unit,
+                                    int unit_scale,
+                                    bool show_degree_symbol,
                                     uint16_t value_color) {
   const int y = 95;
-  const int w = 48;
   const int h = 29;
-  int label_x = x + (w - text_width(label, 2)) / 2;
+  int label_x = x + (w - text_width(label, 1)) / 2;
   int value_w = text_width(value, 2);
   int unit_w = text_width(unit, unit_scale);
-  int unit_x = x + w - unit_w - 3;
-  int value_right = unit_x - 2;
-  int value_x = x + ((value_right - x) - value_w) / 2;
+  int degree_gap = show_degree_symbol ? 6 : 0;
+  int unit_total_w = unit_w + degree_gap;
+  int unit_left_x = x + w - unit_total_w - 3;
+  int value_area_left = x + 4;
+  int value_area_right = unit_left_x - (show_degree_symbol ? 5 : 7);
+  int value_x =
+      value_area_left + ((value_area_right - value_area_left) - value_w) / 2;
+  int unit_y = y + h - 4 - (5 * unit_scale);
 
-  if (value_x < x + 2) {
-    value_x = x + 2;
+  if (value_x < value_area_left) {
+    value_x = value_area_left;
   }
 
   fb_fill_rect(x, y, w, h, RGB565(6, 14, 28));
   fb_draw_rect(x, y, w, h, RGB565(30, 92, 146));
   fb_fill_rect(x + 1, y + 1, w - 2, 2, RGB565(45, 128, 195));
-  fb_draw_text(label_x, y + 4, label, COLOR_WHITE, 2);
-  fb_draw_text(value_x, y + 17, value, value_color, 2);
-  fb_draw_text(unit_x, (unit_scale == 2) ? (y + 17) : (y + 20), unit,
-               COLOR_CYAN, unit_scale);
+  fb_draw_text(label_x, y + 5, label, COLOR_MUTED, 1);
+  fb_draw_text_shadow(value_x, y + 15, value, value_color, RGB565(20, 44, 72),
+                      2);
+  if (show_degree_symbol) {
+    fb_draw_rect(unit_left_x, unit_y + 1, 4, 4, COLOR_CYAN);
+  }
+  fb_draw_text(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, unit_scale);
 }
 
 static void draw_hybrid_overlay(const dashboard_state_t *state) {
   char time_text[16];
   char date_text[16];
-  char co2_text[16];
+  char eco2_text[16];
+  char tvoc_text[16];
   char temp_text[16];
   char hum_text[16];
   char aqi_text[8];
-  const char *sub1 = NULL;
-  const char *sub2 = NULL;
+  char sensor_line[20];
+  const char *ens_status = ens160_validity_label(state->ens_validity);
   int day_display = clamp_int(state->clock.tm_mday, 0, 99);
   int month_display = clamp_int(state->clock.tm_mon + 1, 0, 99);
+
   int year_display = clamp_int(state->clock.tm_year + 1900, 0, 9999);
 
   snprintf(time_text, sizeof(time_text), "%02d:%02d:%02d", state->clock.tm_hour,
            state->clock.tm_min, state->clock.tm_sec);
   snprintf(date_text, sizeof(date_text), "%02d/%02d/%04d", day_display,
            month_display, year_display);
-  snprintf(co2_text, sizeof(co2_text), "%d", state->co2_ppm);
+  snprintf(eco2_text, sizeof(eco2_text), "%d", state->eco2_ppm);
+  snprintf(tvoc_text, sizeof(tvoc_text), "%d", state->tvoc_ppb);
   snprintf(temp_text, sizeof(temp_text), "%d.%d", state->temp_tenths_c / 10,
            abs(state->temp_tenths_c % 10));
   snprintf(hum_text, sizeof(hum_text), "%d", state->humidity_pct);
   snprintf(aqi_text, sizeof(aqi_text), "%d", state->aqi);
-  aqi_subtext(state->aqi, &sub1, &sub2);
+  snprintf(sensor_line, sizeof(sensor_line), "TVOC %d", state->tvoc_ppb);
 
   uint16_t aqi_col = aqi_color(state->aqi);
   const char *aqi_lbl = aqi_label(state->aqi);
+  uint16_t glow = RGB565(16, 34, 55);
 
   fb_clear(COLOR_BG);
 
@@ -770,53 +843,58 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   fb_draw_rect(2, 2, 156, 17, RGB565(26, 70, 120));
   fb_fill_rect(3, 3, 68, 15, RGB565(8, 22, 38));
   fb_fill_rect(72, 3, 85, 15, RGB565(18, 20, 34));
-  fb_draw_text(7, 6, time_text, COLOR_CYAN, 2);
-  fb_draw_text(74, 6, date_text, COLOR_YELLOW, 2);
+  fb_draw_text_shadow(7, 6, time_text, COLOR_CYAN, RGB565(8, 28, 42), 2);
+  fb_draw_text_right(154, 6, date_text, COLOR_YELLOW, 2);
 
-  // Left panel: "AQI" label + big number + status
+  // Left panel: compact AQI block matching the proposal proportions.
   {
-    const int px = 2, py = 21, pw = 77, ph = 71;
+    const int px = 4, py = 23, pw = 58, ph = 69;
     const int cx = px + pw / 2;
     draw_panel(px, py, pw, ph, aqi_col);
-    // "AQI" small header
-    fb_draw_text(cx - text_width("AQI", 2) / 2, py + 5, "AQI", COLOR_MUTED, 2);
-    // Large AQI number (scale 5 = 15×25px glyph)
-    fb_draw_text(cx - text_width(aqi_text, 5) / 2, py + 17, aqi_text, aqi_col,
-                 5);
-    // Status label at bottom of panel
-    fb_draw_text(cx - text_width(aqi_lbl, 2) / 2, py + 55, aqi_lbl, aqi_col, 2);
+    fb_draw_text_centered(cx, py + 7, "AQI", COLOR_MUTED, 2);
+    fb_draw_text_shadow(cx - text_width(aqi_text, 4) / 2, py + 24, aqi_text,
+                        aqi_col, glow, 4);
+    fb_draw_text_centered(cx, py + 55, aqi_lbl, aqi_col, 2);
   }
 
-  // Right panel: status word + sub-text + 5-segment color bar
+  // Right panel: clearer hierarchy with one support line and a compact scale.
   {
     static const uint16_t kScaleColors[] = {
         COLOR_GREEN, COLOR_LIME, COLOR_YELLOW, COLOR_ORANGE, COLOR_RED,
     };
-    const int px = 81, py = 21, pw = 77, ph = 71;
+    const int px = 66, py = 23, pw = 90, ph = 69;
     const int cx = px + pw / 2;
     draw_panel(px, py, pw, ph, aqi_col);
 
-    // Big status word (GOOD / OKAY / POOR …)
-    fb_draw_text(cx - text_width(aqi_lbl, 3) / 2, py + 7, aqi_lbl, aqi_col, 3);
-    // Sub-text lines
-    fb_draw_text(cx - text_width(sub1, 2) / 2, py + 35, sub1, COLOR_WHITE, 2);
-    fb_draw_text(cx - text_width(sub2, 2) / 2, py + 47, sub2, COLOR_MUTED, 2);
+    fb_draw_text_shadow(cx - text_width(aqi_lbl, 3) / 2, py + 8, aqi_lbl,
+                        aqi_col, glow, 3);
+    fb_draw_text_centered(cx, py + 29, sensor_line, COLOR_WHITE, 2);
+    fb_draw_text_centered(cx, py + 45, ens_status, COLOR_MUTED, 1);
 
-    // 5-segment color bar (11px wide × 6px tall, 2px gap)
-    // Total width = 5×11 + 4×2 = 63px, centered in pw=77
-    const int seg_w = 11, seg_h = 6, seg_gap = 2;
+    const int seg_w = 13, seg_h = 6, seg_gap = 2;
     int bar_total = 5 * seg_w + 4 * seg_gap;
     int bar_x = cx - bar_total / 2;
-    int bar_y = py + ph - 13;
+    int bar_y = py + ph - 10;
     for (int s = 0; s < 5; s++) {
       uint16_t sc = (s < state->aqi) ? kScaleColors[s] : RGB565(22, 34, 50);
       fb_fill_rect(bar_x + s * (seg_w + seg_gap), bar_y, seg_w, seg_h, sc);
     }
+
+    {
+      int active_index = clamp_int(state->aqi - 1, 0, 4);
+      int arrow_x = bar_x + active_index * (seg_w + seg_gap) + (seg_w / 2);
+      int arrow_y = bar_y - 1;
+      fb_fill_triangle(arrow_x, arrow_y, arrow_x - 2, arrow_y - 3,
+                       arrow_x + 2, arrow_y - 3, aqi_col);
+    }
   }
 
-  draw_hybrid_metric_card(4, "CO2", co2_text, "PPM", 1, COLOR_YELLOW);
-  draw_hybrid_metric_card(56, "TEMP", temp_text, "C", 2, COLOR_YELLOW);
-  draw_hybrid_metric_card(108, "HUMI", hum_text, "%", 2, COLOR_CYAN);
+  draw_hybrid_metric_card(4, 52, "ECO2", eco2_text, "PPM", 1, false,
+                          COLOR_YELLOW);
+  draw_hybrid_metric_card(60, 52, "TEMP", temp_text, "C", 2, true,
+                          COLOR_YELLOW);
+  draw_hybrid_metric_card(116, 40, "HUM", hum_text, "%", 2, false,
+                          COLOR_CYAN);
 }
 
 static void draw_boot_screen(int percent, const char *status) {
@@ -975,7 +1053,8 @@ static void build_demo_state(dashboard_state_t *state) {
   int elapsed = (int)(esp_timer_get_time() / 1000000LL);
   int temp_wave = (elapsed % 9) - 4;
   int hum_wave = (elapsed % 7) - 3;
-  int co2_wave = (elapsed % 11) - 5;
+  int eco2_wave = (elapsed % 11) - 5;
+  int tvoc_wave = (elapsed % 13) - 6;
 
   if (!s_time_synced) {
     // If SNTP sync finished after initial timeout, auto-switch to real clock.
@@ -997,7 +1076,15 @@ static void build_demo_state(dashboard_state_t *state) {
   }
 
   state->aqi = 2;
-  state->co2_ppm = 742 + (co2_wave * 4);
+  state->eco2_ppm = 742 + (eco2_wave * 4);
+  state->tvoc_ppb = 145 + (tvoc_wave * 6);
+  if (elapsed < 20) {
+    state->ens_validity = 2;
+  } else if (elapsed < 40) {
+    state->ens_validity = 1;
+  } else {
+    state->ens_validity = 0;
+  }
   state->temp_tenths_c = 290 + temp_wave;
   state->humidity_pct = 63 + hum_wave;
 }
