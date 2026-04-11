@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "nvs_flash.h"
 
 // ESP32 <-> ST7735 default wiring
@@ -66,6 +67,12 @@
 #define WIFI_MAXIMUM_RETRY 10
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
+#define CLOCK_SYNC_DONE_BIT BIT2
+#define CLOCK_SYNC_OK_BIT BIT3
+#define CLOCK_SYNC_SUCCESS_INTERVAL_MS (6 * 60 * 60 * 1000)
+#define CLOCK_SYNC_RETRY_INTERVAL_MS (60 * 1000)
+#define CLOCK_SYNC_INITIAL_WAIT_MS (30 * 1000)
+#define SNTP_SETTLE_DELAY_MS 3000
 
 typedef struct {
   char c;
@@ -105,8 +112,15 @@ static const char *TAG = "st7735_dashboard";
 static spi_device_handle_t s_lcd_spi;
 static uint16_t s_framebuffer[TFT_WIDTH * TFT_HEIGHT];
 static EventGroupHandle_t s_wifi_event_group;
+static esp_netif_t *s_wifi_sta_netif;
+static TaskHandle_t s_clock_sync_task_handle;
+static TimerHandle_t s_clock_sync_timer;
 static int s_wifi_retry_num;
 static bool s_time_synced;
+static bool s_wifi_should_connect;
+static bool s_wifi_driver_ready;
+
+static void schedule_clock_sync_retry(uint32_t delay_ms);
 
 static const glyph3x5_t kFont3x5[] = {
     {' ', {0x0, 0x0, 0x0, 0x0, 0x0}}, {'%', {0x5, 0x1, 0x2, 0x4, 0x5}},
@@ -268,33 +282,7 @@ static esp_err_t init_nvs_flash_storage(void) {
   return ret;
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data) {
-  (void)arg;
-  (void)event_data;
-
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-    esp_wifi_connect();
-    return;
-  }
-
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    if (s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
-      esp_wifi_connect();
-      s_wifi_retry_num++;
-      return;
-    }
-    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-    return;
-  }
-
-  if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    s_wifi_retry_num = 0;
-    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-  }
-}
-
-static bool wifi_connect_sta(void) {
+static bool wifi_credentials_configured(void) {
   if (strlen(WIFI_SSID) == 0 || strcmp(WIFI_SSID, "YOUR_WIFI_SSID") == 0) {
     ESP_LOGW(TAG, "WIFI_SSID not configured, skip Wi-Fi time sync");
     return false;
@@ -303,24 +291,210 @@ static bool wifi_connect_sta(void) {
     ESP_LOGW(TAG, "WIFI_PASS is still placeholder, skip Wi-Fi time sync");
     return false;
   }
+  return true;
+}
 
-  s_wifi_event_group = xEventGroupCreate();
+static bool is_system_time_valid(void) {
+  time_t now = 0;
+  time(&now);
+  return now >= 1700000000;
+}
+
+static void wifi_clear_status_bits(void) {
   if (s_wifi_event_group == NULL) {
-    ESP_LOGE(TAG, "Cannot create Wi-Fi event group");
+    return;
+  }
+  xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+  (void)arg;
+
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    wifi_clear_status_bits();
+    ESP_LOGI(TAG, "Wi-Fi STA started, auto_connect=%d", s_wifi_should_connect);
+    if (s_wifi_should_connect) {
+      esp_err_t ret = esp_wifi_connect();
+      if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "esp_wifi_connect on STA_START failed: %s",
+                 esp_err_to_name(ret));
+      }
+    }
+    return;
+  }
+
+  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    wifi_event_sta_disconnected_t *disconnected =
+        (wifi_event_sta_disconnected_t *)event_data;
+    if (s_wifi_event_group != NULL) {
+      xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+    ESP_LOGW(TAG,
+             "Wi-Fi disconnected, auto_connect=%d, retry=%d/%d, reason=%d",
+             s_wifi_should_connect, s_wifi_retry_num, WIFI_MAXIMUM_RETRY,
+             disconnected != NULL ? disconnected->reason : -1);
+    if (!s_wifi_should_connect) {
+      ESP_LOGW(TAG, "Skip reconnect because auto-connect is disabled");
+      return;
+    }
+    if (s_wifi_retry_num < WIFI_MAXIMUM_RETRY) {
+      esp_err_t ret = esp_wifi_connect();
+      if (ret == ESP_OK || ret == ESP_ERR_WIFI_CONN) {
+        ESP_LOGI(TAG, "Reconnect attempt %d/%d started", s_wifi_retry_num + 1,
+                 WIFI_MAXIMUM_RETRY);
+      } else {
+        ESP_LOGW(TAG, "esp_wifi_connect retry failed immediately: %s",
+                 esp_err_to_name(ret));
+      }
+      s_wifi_retry_num++;
+      return;
+    }
+    ESP_LOGW(TAG, "Wi-Fi reconnect attempts exhausted; wait for next sync cycle");
+    schedule_clock_sync_retry(CLOCK_SYNC_RETRY_INTERVAL_MS);
+    xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    return;
+  }
+
+  if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t *got_ip = (ip_event_got_ip_t *)event_data;
+    s_wifi_retry_num = 0;
+    s_wifi_should_connect = true;
+    if (s_wifi_event_group != NULL) {
+      xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+      xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+    if (got_ip != NULL) {
+      ESP_LOGI(TAG, "Wi-Fi got IP: " IPSTR, IP2STR(&got_ip->ip_info.ip));
+    }
+  }
+}
+
+static bool sync_time_tphcm(void) {
+  esp_sntp_config_t sntp_cfg =
+      ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+  bool sntp_started = false;
+
+  // Give DHCP/DNS a moment to settle after STA gets an IP.
+  vTaskDelay(pdMS_TO_TICKS(SNTP_SETTLE_DELAY_MS));
+
+  esp_err_t ret = esp_netif_sntp_init(&sntp_cfg);
+  if (ret == ESP_ERR_INVALID_STATE) {
+    esp_netif_sntp_deinit();
+    ret = esp_netif_sntp_init(&sntp_cfg);
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "SNTP init failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+  sntp_started = true;
+
+  ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(20000));
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "SNTP sync timeout/error: %s", esp_err_to_name(ret));
+    esp_netif_sntp_deinit();
     return false;
   }
 
-  s_wifi_retry_num = 0;
+  time_t now = 0;
+  struct tm tm_info = {0};
+  time(&now);
+  localtime_r(&now, &tm_info);
+  ESP_LOGI(TAG, "Time synced (TPHCM): %04d-%02d-%02d %02d:%02d:%02d",
+           tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+           tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+  if (sntp_started) {
+    esp_netif_sntp_deinit();
+  }
+  return true;
+}
 
-  esp_netif_create_default_wifi_sta();
+static void apply_timezone_tphcm(void) {
+  // UTC+7 (Ho Chi Minh City): POSIX TZ uses reversed sign semantics.
+  setenv("TZ", "UTC-7", 1);
+  tzset();
+}
 
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+static bool wifi_service_init_once(void) {
+  if (!wifi_credentials_configured()) {
+    return false;
+  }
 
-  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                             &wifi_event_handler, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                             &wifi_event_handler, NULL));
+  if (s_wifi_event_group == NULL) {
+    s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+      ESP_LOGE(TAG, "Cannot create Wi-Fi event group");
+      return false;
+    }
+  }
+
+  esp_err_t ret = init_nvs_flash_storage();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  ret = esp_netif_init();
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  ret = esp_event_loop_create_default();
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "event loop init failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  apply_timezone_tphcm();
+
+  if (s_wifi_sta_netif == NULL) {
+    s_wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    if (s_wifi_sta_netif == NULL) {
+      ESP_LOGE(TAG, "Cannot create default Wi-Fi STA netif");
+      return false;
+    }
+  }
+
+  if (!s_wifi_driver_ready) {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(ret));
+      return false;
+    }
+
+    ret = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                     &wifi_event_handler, NULL);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Register WIFI_EVENT handler failed: %s",
+               esp_err_to_name(ret));
+      return false;
+    }
+
+    ret = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                     &wifi_event_handler, NULL);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Register IP_EVENT handler failed: %s",
+               esp_err_to_name(ret));
+      return false;
+    }
+
+    s_wifi_driver_ready = true;
+  }
+
+  return true;
+}
+
+static bool wifi_start_and_wait_for_connection(void) {
+  if (s_wifi_event_group != NULL) {
+    EventBits_t current_bits = xEventGroupGetBits(s_wifi_event_group);
+    if ((current_bits & WIFI_CONNECTED_BIT) != 0) {
+      s_wifi_should_connect = true;
+      ESP_LOGI(TAG, "Wi-Fi already connected, reuse existing link");
+      return true;
+    }
+  }
 
   wifi_config_t wifi_config = {
       .sta =
@@ -333,6 +507,7 @@ static bool wifi_connect_sta(void) {
                   },
           },
   };
+
   strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID,
           sizeof(wifi_config.sta.ssid));
   strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
@@ -341,9 +516,44 @@ static bool wifi_connect_sta(void) {
     wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
   }
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
+  s_wifi_retry_num = 0;
+  s_wifi_should_connect = true;
+  wifi_clear_status_bits();
+  ESP_LOGI(TAG, "Start Wi-Fi connection flow");
+
+  esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
+    s_wifi_should_connect = false;
+    return false;
+  }
+
+  ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(ret));
+    s_wifi_should_connect = false;
+    return false;
+  }
+
+  ret = esp_wifi_start();
+  if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+    ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
+    s_wifi_should_connect = false;
+    return false;
+  }
+  if (ret == ESP_ERR_WIFI_CONN) {
+    ESP_LOGI(TAG, "esp_wifi_start skipped because Wi-Fi is already running");
+  }
+
+  ret = esp_wifi_connect();
+  if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+    ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(ret));
+    s_wifi_should_connect = false;
+    return false;
+  }
+  if (ret == ESP_ERR_WIFI_CONN) {
+    ESP_LOGI(TAG, "esp_wifi_connect called while STA is already connecting");
+  }
 
   EventBits_t bits = xEventGroupWaitBits(
       s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE,
@@ -356,70 +566,111 @@ static bool wifi_connect_sta(void) {
 
   if ((bits & WIFI_FAIL_BIT) != 0) {
     ESP_LOGW(TAG, "Wi-Fi connect failed after retries");
-    return false;
+  } else {
+    ESP_LOGW(TAG, "Wi-Fi connect timeout, keep auto-connect enabled");
   }
-
-  ESP_LOGW(TAG, "Wi-Fi connect timeout");
   return false;
 }
 
-static bool sync_time_tphcm(void) {
-  esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-
-  esp_err_t ret = esp_netif_sntp_init(&sntp_cfg);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "SNTP init failed: %s", esp_err_to_name(ret));
-    return false;
+static void schedule_clock_sync_retry(uint32_t delay_ms) {
+  if (s_clock_sync_timer == NULL) {
+    return;
   }
 
-  ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(20000));
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "SNTP sync timeout/error: %s", esp_err_to_name(ret));
-    return false;
+  ESP_LOGI(TAG, "Schedule next Wi-Fi/SNTP retry in %lu ms",
+           (unsigned long)delay_ms);
+  if (xTimerChangePeriod(s_clock_sync_timer, pdMS_TO_TICKS(delay_ms), 0) !=
+      pdPASS) {
+    ESP_LOGW(TAG, "Failed to schedule next clock sync in %lu ms",
+             (unsigned long)delay_ms);
   }
-
-  time_t now = 0;
-  struct tm tm_info = {0};
-  time(&now);
-  localtime_r(&now, &tm_info);
-  ESP_LOGI(TAG, "Time synced (TPHCM): %04d-%02d-%02d %02d:%02d:%02d",
-           tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
-           tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-  return true;
 }
 
-static void apply_timezone_tphcm(void) {
-  // UTC+7 (Ho Chi Minh City): POSIX TZ uses reversed sign semantics.
-  setenv("TZ", "UTC-7", 1);
-  tzset();
+static void clock_sync_timer_callback(TimerHandle_t timer) {
+  (void)timer;
+  if (s_clock_sync_task_handle != NULL) {
+    xTaskNotifyGive(s_clock_sync_task_handle);
+  }
+}
+
+static bool run_clock_sync_cycle(void) {
+  bool connected = false;
+  bool synced = false;
+
+  if (!wifi_service_init_once()) {
+    return false;
+  }
+
+  connected = wifi_start_and_wait_for_connection();
+  if (!connected) {
+    return false;
+  }
+
+  synced = sync_time_tphcm();
+  s_time_synced = s_time_synced || synced || is_system_time_valid();
+  return synced;
+}
+
+static void clock_sync_task(void *arg) {
+  (void)arg;
+
+  while (true) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (s_wifi_event_group != NULL) {
+      xEventGroupClearBits(s_wifi_event_group,
+                           CLOCK_SYNC_DONE_BIT | CLOCK_SYNC_OK_BIT);
+    }
+
+    bool synced = run_clock_sync_cycle();
+    if (s_wifi_event_group != NULL) {
+      EventBits_t bits = CLOCK_SYNC_DONE_BIT;
+      if (synced || is_system_time_valid()) {
+        s_time_synced = true;
+        bits |= CLOCK_SYNC_OK_BIT;
+      }
+      xEventGroupSetBits(s_wifi_event_group, bits);
+    }
+
+    schedule_clock_sync_retry(s_time_synced ? CLOCK_SYNC_SUCCESS_INTERVAL_MS
+                                            : CLOCK_SYNC_RETRY_INTERVAL_MS);
+  }
 }
 
 static void setup_connectivity_and_clock(void) {
-  esp_err_t ret = init_nvs_flash_storage();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(ret));
+  if (!wifi_service_init_once()) {
     return;
   }
 
-  ret = esp_netif_init();
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(ret));
-    return;
+  if (s_clock_sync_task_handle == NULL) {
+    BaseType_t task_ok = xTaskCreate(clock_sync_task, "clock_sync", 4096, NULL,
+                                     5, &s_clock_sync_task_handle);
+    if (task_ok != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create clock sync task");
+      s_clock_sync_task_handle = NULL;
+      return;
+    }
   }
 
-  ret = esp_event_loop_create_default();
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "event loop init failed: %s", esp_err_to_name(ret));
-    return;
+  if (s_clock_sync_timer == NULL) {
+    s_clock_sync_timer = xTimerCreate("clock_sync_timer", pdMS_TO_TICKS(1000),
+                                      pdFALSE, NULL, clock_sync_timer_callback);
+    if (s_clock_sync_timer == NULL) {
+      ESP_LOGE(TAG, "Failed to create clock sync timer");
+      return;
+    }
   }
 
-  apply_timezone_tphcm();
+  xEventGroupClearBits(s_wifi_event_group,
+                       CLOCK_SYNC_DONE_BIT | CLOCK_SYNC_OK_BIT);
+  xTaskNotifyGive(s_clock_sync_task_handle);
 
-  if (!wifi_connect_sta()) {
-    return;
+  EventBits_t bits = xEventGroupWaitBits(
+      s_wifi_event_group, CLOCK_SYNC_DONE_BIT | CLOCK_SYNC_OK_BIT, pdFALSE,
+      pdFALSE, pdMS_TO_TICKS(CLOCK_SYNC_INITIAL_WAIT_MS));
+  if ((bits & CLOCK_SYNC_OK_BIT) != 0 || is_system_time_valid()) {
+    s_time_synced = true;
   }
-
-  s_time_synced = sync_time_tphcm();
 }
 
 static void lcd_send_cmd(uint8_t cmd) {
@@ -629,22 +880,29 @@ static void fb_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
   int min_y = y0;
   int max_y = y0;
 
-  if (x1 < min_x) min_x = x1;
-  if (x2 < min_x) min_x = x2;
-  if (x1 > max_x) max_x = x1;
-  if (x2 > max_x) max_x = x2;
-  if (y1 < min_y) min_y = y1;
-  if (y2 < min_y) min_y = y2;
-  if (y1 > max_y) max_y = y1;
-  if (y2 > max_y) max_y = y2;
+  if (x1 < min_x)
+    min_x = x1;
+  if (x2 < min_x)
+    min_x = x2;
+  if (x1 > max_x)
+    max_x = x1;
+  if (x2 > max_x)
+    max_x = x2;
+  if (y1 < min_y)
+    min_y = y1;
+  if (y2 < min_y)
+    min_y = y2;
+  if (y1 > max_y)
+    max_y = y1;
+  if (y2 > max_y)
+    max_y = y2;
 
   for (int y = min_y; y <= max_y; ++y) {
     for (int x = min_x; x <= max_x; ++x) {
       int w0 = (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0);
       int w1 = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
       int w2 = (x0 - x2) * (y - y2) - (y0 - y2) * (x - x2);
-      if ((w0 >= 0 && w1 >= 0 && w2 >= 0) ||
-          (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+      if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
         fb_draw_pixel(x, y, color);
       }
     }
@@ -838,8 +1096,8 @@ static void aqi_subtext(int aqi, const char **line1, const char **line2) {
 }
 
 static void draw_wifi_arc_band(int cx, int cy, int inner_radius,
-                               int outer_radius, float start_deg,
-                               float end_deg, uint16_t color) {
+                               int outer_radius, float start_deg, float end_deg,
+                               uint16_t color) {
   const float center_deg = (start_deg + end_deg) * 0.5f;
   const float half_sweep = (end_deg - start_deg) * 0.5f;
 
@@ -909,8 +1167,7 @@ static void draw_metric_card(int x, int y, int w, int h, const char *label,
 
 static void draw_hybrid_metric_card(int x, int w, const char *label,
                                     const char *value, const char *unit,
-                                    int unit_scale,
-                                    bool show_degree_symbol,
+                                    int unit_scale, bool show_degree_symbol,
                                     uint16_t value_color) {
   const int y = 95;
   const int h = 29;
@@ -1041,8 +1298,8 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
       int active_index = clamp_int(state->aqi - 1, 0, 4);
       int arrow_x = bar_x + active_index * (seg_w + seg_gap) + (seg_w / 2);
       int arrow_y = bar_y - 1;
-      fb_fill_triangle(arrow_x, arrow_y, arrow_x - 2, arrow_y - 3,
-                       arrow_x + 2, arrow_y - 3, aqi_col);
+      fb_fill_triangle(arrow_x, arrow_y, arrow_x - 2, arrow_y - 3, arrow_x + 2,
+                       arrow_y - 3, aqi_col);
     }
   }
 
@@ -1050,8 +1307,7 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
                           COLOR_YELLOW);
   draw_hybrid_metric_card(60, 52, "TEMP", temp_text, "C", 2, true,
                           COLOR_YELLOW);
-  draw_hybrid_metric_card(116, 40, "HUM", hum_text, "%", 2, false,
-                          COLOR_CYAN);
+  draw_hybrid_metric_card(116, 40, "HUM", hum_text, "%", 2, false, COLOR_CYAN);
 }
 
 static void draw_boot_screen(int percent, const char *status) {
