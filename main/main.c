@@ -837,11 +837,50 @@ static void aqi_subtext(int aqi, const char **line1, const char **line2) {
   *line2 = "NOW";
 }
 
+static void draw_wifi_arc_band(int cx, int cy, int inner_radius,
+                               int outer_radius, float start_deg,
+                               float end_deg, uint16_t color) {
+  const float center_deg = (start_deg + end_deg) * 0.5f;
+  const float half_sweep = (end_deg - start_deg) * 0.5f;
+
+  for (float offset = 0.0f; offset <= half_sweep; offset += 1.0f) {
+    float left_rad = (center_deg - offset) * DEG_TO_RAD;
+    float right_rad = (center_deg + offset) * DEG_TO_RAD;
+
+    for (int radius = inner_radius; radius <= outer_radius; ++radius) {
+      int left_x = cx + (int)lroundf(cosf(left_rad) * radius);
+      int left_y = cy + (int)lroundf(sinf(left_rad) * radius);
+      int right_x = cx + (int)lroundf(cosf(right_rad) * radius);
+      int right_y = cy + (int)lroundf(sinf(right_rad) * radius);
+
+      fb_draw_line(left_x, left_y, right_x, right_y, color);
+    }
+  }
+}
+
 static void draw_wifi_icon(int cx, int cy, uint16_t color) {
-  fb_draw_arc_segment(cx, cy, 6, 7, 220.0f, 320.0f, color);
-  fb_draw_arc_segment(cx, cy, 10, 11, 220.0f, 320.0f, color);
-  fb_draw_arc_segment(cx, cy, 14, 15, 220.0f, 320.0f, color);
-  fb_fill_circle(cx, cy + 8, 2, color);
+  const int base_y = cy + 8;
+
+  draw_wifi_arc_band(cx, base_y, 6, 7, 222.0f, 318.0f, color);
+  draw_wifi_arc_band(cx, base_y, 3, 4, 228.0f, 312.0f, color);
+  draw_wifi_arc_band(cx, base_y, 1, 2, 238.0f, 302.0f, color);
+  fb_draw_pixel(cx, base_y - 1, color);
+  fb_draw_line(cx - 1, base_y, cx + 1, base_y, color);
+  fb_draw_pixel(cx, base_y + 1, color);
+}
+
+static void draw_wifi_offline_icon(int cx, int cy, uint16_t color,
+                                   uint16_t slash_color) {
+  (void)slash_color;
+  draw_wifi_icon(cx, cy, color);
+}
+
+static bool is_wifi_connected_for_ui(void) {
+  if (s_wifi_event_group == NULL) {
+    return false;
+  }
+  EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+  return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
 static void draw_panel(int x, int y, int w, int h, uint16_t accent) {
@@ -917,6 +956,7 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   char aqi_text[8];
   char sensor_line[20];
   const char *ens_status = ens160_validity_label(state->ens_validity);
+  bool wifi_connected = is_wifi_connected_for_ui();
   int day_display = clamp_int(state->clock.tm_mday, 0, 99);
   int month_display = clamp_int(state->clock.tm_mon + 1, 0, 99);
 
@@ -941,8 +981,11 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   const int right_header_x = 73;
   const int right_header_w = 84;
   const int time_x = 6;
+  const int time_right_x = time_x + text5x7_width(time_text, 1);
   const int date_right_x = 153;
   const int date_x = date_right_x - text5x7_width(date_text, 1);
+  const int wifi_cx = time_right_x + ((date_x - time_right_x) / 2);
+  const int wifi_cy = 5;
 
   fb_clear(COLOR_BG);
 
@@ -953,6 +996,11 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   fb_fill_rect(right_header_x, 3, right_header_w, 15, RGB565(18, 20, 34));
   fb_draw_text5x7_shadow(time_x, 6, time_text, COLOR_CYAN, RGB565(8, 28, 42),
                          1);
+  if (wifi_connected) {
+    draw_wifi_icon(wifi_cx, wifi_cy, COLOR_LIME);
+  } else {
+    draw_wifi_offline_icon(wifi_cx, wifi_cy, COLOR_MUTED, COLOR_RED);
+  }
   fb_draw_text5x7(date_x, 6, date_text, COLOR_YELLOW, 1);
 
   // Left panel: compact AQI block matching the proposal proportions.
