@@ -51,6 +51,9 @@
   (uint16_t)((((r)&0xF8) << 8) | (((g)&0xFC) << 3) | ((b) >> 3))
 // 1 = use hybrid runtime UI (black background + data cards).
 #define SHOW_BITMAP_UI 1
+// 1 = cycle demo values through AQI thresholds so the full UI can be reviewed.
+#define DEMO_AQI_SWEEP 1
+#define DEMO_AQI_STEP_SECONDS 6
 
 #ifndef WIFI_SSID
 #define WIFI_SSID "PQ"
@@ -68,6 +71,11 @@ typedef struct {
   char c;
   uint8_t rows[5];
 } glyph3x5_t;
+
+typedef struct {
+  char c;
+  uint8_t rows[7];
+} glyph5x7_t;
 
 typedef struct {
   int8_t x;
@@ -119,7 +127,51 @@ static const glyph3x5_t kFont3x5[] = {
     {'Q', {0x7, 0x5, 0x5, 0x7, 0x1}}, {'R', {0x6, 0x5, 0x6, 0x5, 0x5}},
     {'S', {0x7, 0x4, 0x7, 0x1, 0x7}}, {'T', {0x7, 0x2, 0x2, 0x2, 0x2}},
     {'U', {0x5, 0x5, 0x5, 0x5, 0x7}}, {'V', {0x5, 0x5, 0x5, 0x5, 0x2}},
-    {'W', {0x5, 0x5, 0x7, 0x7, 0x5}}, {'Y', {0x5, 0x5, 0x2, 0x2, 0x2}},
+    {'W', {0x5, 0x5, 0x7, 0x7, 0x5}}, {'X', {0x5, 0x5, 0x2, 0x5, 0x5}},
+    {'Y', {0x5, 0x5, 0x2, 0x2, 0x2}},
+};
+
+static const glyph5x7_t kFont5x7[] = {
+    {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'%', {0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13}},
+    {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
+    {'/', {0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00}},
+    {':', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}},
+    {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+    {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+    {'3', {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}},
+    {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+    {'5', {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}},
+    {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+    {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+    {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+    {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'D', {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+    {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
+    {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
+    {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+    {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+    {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
 };
 
 static const star_t kStars[] = {
@@ -608,8 +660,21 @@ static const uint8_t *font_lookup(char c) {
   return kFont3x5[0].rows;
 }
 
+static const uint8_t *font5x7_lookup(char c) {
+  for (size_t i = 0; i < sizeof(kFont5x7) / sizeof(kFont5x7[0]); ++i) {
+    if (kFont5x7[i].c == c) {
+      return kFont5x7[i].rows;
+    }
+  }
+  return kFont5x7[0].rows;
+}
+
 static int text_width(const char *text, int scale) {
   return (int)strlen(text) * 4 * scale;
+}
+
+static int text5x7_width(const char *text, int scale) {
+  return (int)strlen(text) * 6 * scale;
 }
 
 static void fb_draw_char(int x, int y, char c, uint16_t color, int scale) {
@@ -618,6 +683,18 @@ static void fb_draw_char(int x, int y, char c, uint16_t color, int scale) {
   for (int row = 0; row < 5; ++row) {
     for (int col = 0; col < 3; ++col) {
       if (rows[row] & (1 << (2 - col))) {
+        fb_fill_rect(x + (col * scale), y + (row * scale), scale, scale, color);
+      }
+    }
+  }
+}
+
+static void fb_draw_char5x7(int x, int y, char c, uint16_t color, int scale) {
+  const uint8_t *rows = font5x7_lookup(c);
+
+  for (int row = 0; row < 7; ++row) {
+    for (int col = 0; col < 5; ++col) {
+      if (rows[row] & (1 << (4 - col))) {
         fb_fill_rect(x + (col * scale), y + (row * scale), scale, scale, color);
       }
     }
@@ -633,15 +710,36 @@ static void fb_draw_text(int x, int y, const char *text, uint16_t color,
   }
 }
 
+static void fb_draw_text5x7(int x, int y, const char *text, uint16_t color,
+                            int scale) {
+  int len = (int)strlen(text);
+  for (int i = 0; i < len; ++i) {
+    fb_draw_char5x7(x + i * 6 * scale, y, text[i], color, scale);
+  }
+}
+
 static void fb_draw_text_shadow(int x, int y, const char *text, uint16_t color,
                                 uint16_t shadow_color, int scale) {
   fb_draw_text(x + 1, y + 1, text, shadow_color, scale);
   fb_draw_text(x, y, text, color, scale);
 }
 
+static void fb_draw_text5x7_shadow(int x, int y, const char *text,
+                                   uint16_t color, uint16_t shadow_color,
+                                   int scale) {
+  fb_draw_text5x7(x + 1, y + 1, text, shadow_color, scale);
+  fb_draw_text5x7(x, y, text, color, scale);
+}
+
 static void fb_draw_text_centered(int center_x, int y, const char *text,
                                   uint16_t color, int scale) {
   fb_draw_text(center_x - text_width(text, scale) / 2, y, text, color, scale);
+}
+
+static void fb_draw_text5x7_centered(int center_x, int y, const char *text,
+                                     uint16_t color, int scale) {
+  fb_draw_text5x7(center_x - text5x7_width(text, scale) / 2, y, text, color,
+                  scale);
 }
 
 static void fb_draw_text_right(int right_x, int y, const char *text,
@@ -692,18 +790,18 @@ static uint16_t aqi_color(int aqi) {
 
 static const char *aqi_label(int aqi) {
   if (aqi <= 1) {
-    return "BEST";
+    return "EXCLNT";
   }
   if (aqi == 2) {
     return "GOOD";
   }
   if (aqi == 3) {
-    return "OKAY";
+    return "MODER";
   }
   if (aqi == 4) {
     return "POOR";
   }
-  return "ALERT";
+  return "UNHLTY";
 }
 
 static const char *ens160_validity_label(int validity) {
@@ -777,17 +875,18 @@ static void draw_hybrid_metric_card(int x, int w, const char *label,
                                     uint16_t value_color) {
   const int y = 95;
   const int h = 29;
-  int label_x = x + (w - text_width(label, 1)) / 2;
+  (void)unit_scale;
   int value_w = text_width(value, 2);
-  int unit_w = text_width(unit, unit_scale);
-  int degree_gap = show_degree_symbol ? 6 : 0;
+  bool compact_unit = (!show_degree_symbol && strlen(value) >= 4);
+  int unit_w = compact_unit ? text_width(unit, 1) : text5x7_width(unit, 1);
+  int degree_gap = show_degree_symbol ? 5 : 0;
   int unit_total_w = unit_w + degree_gap;
   int unit_left_x = x + w - unit_total_w - 3;
   int value_area_left = x + 4;
-  int value_area_right = unit_left_x - (show_degree_symbol ? 5 : 7);
+  int value_area_right = unit_left_x - 6;
   int value_x =
       value_area_left + ((value_area_right - value_area_left) - value_w) / 2;
-  int unit_y = y + h - 4 - (5 * unit_scale);
+  int unit_y = compact_unit ? (y + h - 8) : (y + h - 11);
 
   if (value_x < value_area_left) {
     value_x = value_area_left;
@@ -796,20 +895,23 @@ static void draw_hybrid_metric_card(int x, int w, const char *label,
   fb_fill_rect(x, y, w, h, RGB565(6, 14, 28));
   fb_draw_rect(x, y, w, h, RGB565(30, 92, 146));
   fb_fill_rect(x + 1, y + 1, w - 2, 2, RGB565(45, 128, 195));
-  fb_draw_text(label_x, y + 5, label, COLOR_MUTED, 1);
+  fb_draw_text5x7_centered(x + (w / 2), y + 4, label, COLOR_MUTED, 1);
   fb_draw_text_shadow(value_x, y + 15, value, value_color, RGB565(20, 44, 72),
                       2);
   if (show_degree_symbol) {
-    fb_draw_rect(unit_left_x, unit_y + 1, 4, 4, COLOR_CYAN);
+    fb_draw_rect(unit_left_x, unit_y + 1, 3, 3, COLOR_CYAN);
   }
-  fb_draw_text(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, unit_scale);
+  if (compact_unit) {
+    fb_draw_text(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, 1);
+  } else {
+    fb_draw_text5x7(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, 1);
+  }
 }
 
 static void draw_hybrid_overlay(const dashboard_state_t *state) {
   char time_text[16];
   char date_text[16];
   char eco2_text[16];
-  char tvoc_text[16];
   char temp_text[16];
   char hum_text[16];
   char aqi_text[8];
@@ -825,7 +927,6 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   snprintf(date_text, sizeof(date_text), "%02d/%02d/%04d", day_display,
            month_display, year_display);
   snprintf(eco2_text, sizeof(eco2_text), "%d", state->eco2_ppm);
-  snprintf(tvoc_text, sizeof(tvoc_text), "%d", state->tvoc_ppb);
   snprintf(temp_text, sizeof(temp_text), "%d.%d", state->temp_tenths_c / 10,
            abs(state->temp_tenths_c % 10));
   snprintf(hum_text, sizeof(hum_text), "%d", state->humidity_pct);
@@ -835,26 +936,34 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   uint16_t aqi_col = aqi_color(state->aqi);
   const char *aqi_lbl = aqi_label(state->aqi);
   uint16_t glow = RGB565(16, 34, 55);
+  const int left_header_x = 3;
+  const int left_header_w = 70;
+  const int right_header_x = 73;
+  const int right_header_w = 84;
+  const int time_x = 6;
+  const int date_right_x = 153;
+  const int date_x = date_right_x - text5x7_width(date_text, 1);
 
   fb_clear(COLOR_BG);
 
   // Top bar: clock (left) + date (right)
   fb_fill_rect(2, 2, 156, 17, RGB565(4, 10, 20));
   fb_draw_rect(2, 2, 156, 17, RGB565(26, 70, 120));
-  fb_fill_rect(3, 3, 68, 15, RGB565(8, 22, 38));
-  fb_fill_rect(72, 3, 85, 15, RGB565(18, 20, 34));
-  fb_draw_text_shadow(7, 6, time_text, COLOR_CYAN, RGB565(8, 28, 42), 2);
-  fb_draw_text_right(154, 6, date_text, COLOR_YELLOW, 2);
+  fb_fill_rect(left_header_x, 3, left_header_w, 15, RGB565(8, 22, 38));
+  fb_fill_rect(right_header_x, 3, right_header_w, 15, RGB565(18, 20, 34));
+  fb_draw_text5x7_shadow(time_x, 6, time_text, COLOR_CYAN, RGB565(8, 28, 42),
+                         1);
+  fb_draw_text5x7(date_x, 6, date_text, COLOR_YELLOW, 1);
 
   // Left panel: compact AQI block matching the proposal proportions.
   {
     const int px = 4, py = 23, pw = 58, ph = 69;
     const int cx = px + pw / 2;
     draw_panel(px, py, pw, ph, aqi_col);
-    fb_draw_text_centered(cx, py + 7, "AQI", COLOR_MUTED, 2);
+    fb_draw_text5x7_centered(cx, py + 7, "AQI", COLOR_MUTED, 1);
     fb_draw_text_shadow(cx - text_width(aqi_text, 4) / 2, py + 24, aqi_text,
                         aqi_col, glow, 4);
-    fb_draw_text_centered(cx, py + 55, aqi_lbl, aqi_col, 2);
+    fb_draw_text5x7_centered(cx, py + 54, "INDEX", COLOR_MUTED, 1);
   }
 
   // Right panel: clearer hierarchy with one support line and a compact scale.
@@ -866,10 +975,10 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
     const int cx = px + pw / 2;
     draw_panel(px, py, pw, ph, aqi_col);
 
-    fb_draw_text_shadow(cx - text_width(aqi_lbl, 3) / 2, py + 8, aqi_lbl,
-                        aqi_col, glow, 3);
-    fb_draw_text_centered(cx, py + 29, sensor_line, COLOR_WHITE, 2);
-    fb_draw_text_centered(cx, py + 45, ens_status, COLOR_MUTED, 1);
+    fb_draw_text5x7_shadow(cx - text5x7_width(aqi_lbl, 2) / 2, py + 8, aqi_lbl,
+                           aqi_col, glow, 2);
+    fb_draw_text5x7_centered(cx, py + 31, sensor_line, COLOR_WHITE, 1);
+    fb_draw_text5x7_centered(cx, py + 43, ens_status, COLOR_MUTED, 1);
 
     const int seg_w = 13, seg_h = 6, seg_gap = 2;
     int bar_total = 5 * seg_w + 4 * seg_gap;
@@ -1036,6 +1145,11 @@ static void draw_dashboard(const dashboard_state_t *state) {
 static void build_demo_state(dashboard_state_t *state) {
   static bool initialized = false;
   static time_t base_epoch;
+#if DEMO_AQI_SWEEP
+  static const int kDemoAqiLevels[] = {1, 2, 3, 4, 5};
+  static const int kDemoEco2Levels[] = {420, 720, 950, 1300, 1800};
+  static const int kDemoTvocLevels[] = {35, 120, 260, 420, 650};
+#endif
 
   if (!initialized) {
     struct tm demo_start = {
@@ -1075,6 +1189,16 @@ static void build_demo_state(dashboard_state_t *state) {
     localtime_r(&current, &state->clock);
   }
 
+#if DEMO_AQI_SWEEP
+  {
+    int stage = (elapsed / DEMO_AQI_STEP_SECONDS) %
+                (int)(sizeof(kDemoAqiLevels) / sizeof(kDemoAqiLevels[0]));
+    state->aqi = kDemoAqiLevels[stage];
+    state->eco2_ppm = kDemoEco2Levels[stage] + (eco2_wave * 2);
+    state->tvoc_ppb = kDemoTvocLevels[stage] + (tvoc_wave * 4);
+    state->ens_validity = 0;
+  }
+#else
   state->aqi = 2;
   state->eco2_ppm = 742 + (eco2_wave * 4);
   state->tvoc_ppb = 145 + (tvoc_wave * 6);
@@ -1085,6 +1209,7 @@ static void build_demo_state(dashboard_state_t *state) {
   } else {
     state->ens_validity = 0;
   }
+#endif
   state->temp_tenths_c = 290 + temp_wave;
   state->humidity_pct = 63 + hum_wave;
 }
