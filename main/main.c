@@ -330,8 +330,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (s_wifi_event_group != NULL) {
       xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
-    ESP_LOGW(TAG,
-             "Wi-Fi disconnected, auto_connect=%d, retry=%d/%d, reason=%d",
+    ESP_LOGW(TAG, "Wi-Fi disconnected, auto_connect=%d, retry=%d/%d, reason=%d",
              s_wifi_should_connect, s_wifi_retry_num, WIFI_MAXIMUM_RETRY,
              disconnected != NULL ? disconnected->reason : -1);
     if (!s_wifi_should_connect) {
@@ -350,7 +349,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       s_wifi_retry_num++;
       return;
     }
-    ESP_LOGW(TAG, "Wi-Fi reconnect attempts exhausted; wait for next sync cycle");
+    ESP_LOGW(TAG,
+             "Wi-Fi reconnect attempts exhausted; wait for next sync cycle");
     schedule_clock_sync_retry(CLOCK_SYNC_RETRY_INTERVAL_MS);
     xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
     return;
@@ -371,8 +371,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 static bool sync_time_tphcm(void) {
-  esp_sntp_config_t sntp_cfg =
-      ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+  esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
   bool sntp_started = false;
 
   // Give DHCP/DNS a moment to settle after STA gets an IP.
@@ -1307,42 +1306,72 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
                           COLOR_YELLOW);
   draw_hybrid_metric_card(60, 52, "TEMP", temp_text, "C", 2, true,
                           COLOR_YELLOW);
-  draw_hybrid_metric_card(116, 40, "HUM", hum_text, "%", 2, false, COLOR_CYAN);
+  draw_hybrid_metric_card(116, 40, "HUMI", hum_text, "%", 2, false, COLOR_CYAN);
 }
 
 static void draw_boot_screen(int percent, const char *status) {
   char percent_text[8];
-  int bar_x = 14;
-  int bar_y = 72;
-  int bar_w = 132;
-  int bar_h = 14;
+  const int shell_x = 6;
+  const int shell_y = 8;
+  const int shell_w = 148;
+  const int shell_h = 112;
+  const int shell_cx = shell_x + (shell_w / 2);
+  const int bar_x = 18;
+  const int bar_y = 92;
+  const int bar_w = 124;
+  const int bar_h = 9;
+  const int card_x = 15;
+  const int card_y = 60;
+  const int card_w = 128;
+  const int card_h = 28;
   int fill_w;
-  uint16_t chrome = RGB565(35, 120, 185);
+  uint16_t shell_border = RGB565(26, 72, 110);
+  uint16_t shell_glow = RGB565(10, 28, 48);
   uint16_t accent = RGB565(70, 230, 255);
+  uint16_t accent_soft = RGB565(32, 110, 170);
   uint16_t fill = RGB565(110, 245, 170);
+  uint16_t fill_glow = RGB565(42, 120, 96);
+  uint16_t dim = RGB565(118, 146, 176);
 
   percent = clamp_int(percent, 0, 100);
   fill_w = ((bar_w - 2) * percent) / 100;
 
   fb_clear(COLOR_BG);
-  fb_draw_rect(1, 1, TFT_WIDTH - 2, TFT_HEIGHT - 2, RGB565(14, 46, 74));
-  fb_draw_rect(4, 4, TFT_WIDTH - 8, TFT_HEIGHT - 8, chrome);
-  fb_draw_hline(8, 14, TFT_WIDTH - 16, RGB565(18, 66, 104));
-  fb_draw_hline(8, 48, TFT_WIDTH - 16, RGB565(18, 66, 104));
+  fb_fill_rect(4, 4, TFT_WIDTH - 8, TFT_HEIGHT - 8, RGB565(3, 8, 16));
+  fb_draw_rect(1, 1, TFT_WIDTH - 2, TFT_HEIGHT - 2, RGB565(9, 34, 54));
+  fb_draw_rect(4, 4, TFT_WIDTH - 8, TFT_HEIGHT - 8, RGB565(12, 48, 75));
 
-  fb_draw_text(16, 20, "AIR CORE", accent, 3);
-  fb_draw_text(20, 36, "SYSTEM INIT", COLOR_WHITE, 2);
-  fb_draw_text(12, 56, status, COLOR_CYAN, 2);
+  fb_fill_rect(shell_x, shell_y, shell_w, shell_h, shell_glow);
+  fb_draw_rect(shell_x, shell_y, shell_w, shell_h, shell_border);
+  fb_draw_rect(shell_x + 2, shell_y + 2, shell_w - 4, shell_h - 4,
+               RGB565(9, 42, 68));
+
+  fb_fill_rect(shell_x + 10, shell_y + 8, 22, 2, accent);
+  fb_fill_rect(shell_x + 36, shell_y + 8, 8, 2, fill);
+  fb_fill_rect(shell_x + shell_w - 32, shell_y + 8, 22, 2, accent_soft);
+
+  fb_draw_text5x7_centered(shell_cx, 20, "AIR QUALITY NODE", dim, 1);
+  fb_draw_text5x7_shadow(shell_cx - text5x7_width("SYSTEM BOOT", 2) / 2, 33,
+                         "SYSTEM BOOT", COLOR_WHITE, RGB565(12, 36, 58), 2);
+  fb_fill_rect(shell_cx - 18, 53, 36, 2, accent_soft);
+  fb_fill_rect(shell_cx - 10, 53, 20, 2, accent);
+
+  fb_fill_rect(card_x, card_y, card_w, card_h, RGB565(6, 18, 30));
+  fb_draw_rect(card_x, card_y, card_w, card_h, accent_soft);
+  fb_fill_rect(card_x + 1, card_y + 1, card_w - 2, 2, accent);
+  fb_draw_text5x7(22, 66, "ACTIVE STAGE", COLOR_MUTED, 1);
+  qu fb_draw_text5x7_centered(card_x + (card_w / 2), 78, status, COLOR_CYAN, 1);
 
   fb_fill_rect(bar_x, bar_y, bar_w, bar_h, RGB565(6, 16, 30));
-  fb_draw_rect(bar_x, bar_y, bar_w, bar_h, chrome);
+  fb_draw_rect(bar_x, bar_y, bar_w, bar_h, accent_soft);
   if (fill_w > 0) {
-    fb_fill_rect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, fill);
+    fb_fill_rect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, fill_glow);
+    fb_fill_rect(bar_x + 1, bar_y + 1, fill_w, 2, fill);
   }
 
   snprintf(percent_text, sizeof(percent_text), "%3d%%", percent);
-  fb_draw_text(56, 94, percent_text, COLOR_WHITE, 3);
-  fb_draw_text(20, 112, "DO NOT POWER OFF", RGB565(130, 180, 220), 1);
+  fb_draw_text5x7(18, 106, "SYNC PROGRESS", COLOR_MUTED, 1);
+  fb_draw_text5x7(shell_x + shell_w - 41, 106, percent_text, COLOR_WHITE, 1);
 }
 
 #if !SHOW_BITMAP_UI
