@@ -65,6 +65,10 @@
 // 1 = cycle stub AQI values through all thresholds so the UI can be reviewed.
 #define DEMO_AQI_SWEEP 1
 #define DEMO_AQI_STEP_SECONDS 6
+#define MENU_SMOKE_AUTOPLAY 1
+#define MENU_SMOKE_STEP_MS 1400
+#define DASHBOARD_SENSOR_REFRESH_MS 1000
+#define DISPLAY_FRAME_INTERVAL_MS 20
 
 #ifndef WIFI_SSID
 #define WIFI_SSID "PQ"
@@ -139,6 +143,24 @@ typedef struct {
   uint16_t delay_ms;
 } lcd_init_cmd_t;
 
+typedef enum {
+  LOCAL_SCREEN_MONITOR = 0,
+  LOCAL_SCREEN_WIFI,
+  LOCAL_SCREEN_ALARM,
+  LOCAL_SCREEN_GAME,
+  LOCAL_SCREEN_MEMORY,
+  LOCAL_SCREEN_COUNT,
+} local_screen_t;
+
+typedef struct {
+  bool visible;
+  local_screen_t active_screen;
+  int selected_index;
+  int highlight_y_q8;
+  int highlight_velocity_q8;
+  uint8_t pulse_phase;
+} local_menu_state_t;
+
 static const char *TAG = "st7735_dashboard";
 
 static spi_device_handle_t s_lcd_spi;
@@ -164,6 +186,17 @@ static char s_provisioning_ap_ssid[33];
 static dashboard_state_t s_latest_dashboard_state;
 static bool s_latest_dashboard_state_valid;
 static portMUX_TYPE s_dashboard_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static local_menu_state_t s_local_menu = {
+    .visible = false,
+    .active_screen = LOCAL_SCREEN_MONITOR,
+    .selected_index = 0,
+    .highlight_y_q8 = 0,
+    .highlight_velocity_q8 = 0,
+    .pulse_phase = 0,
+};
+static portMUX_TYPE s_local_menu_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_menu_smoke_demo_started;
+static int64_t s_menu_smoke_demo_started_us;
 
 extern const uint8_t web_index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t web_index_html_end[] asm("_binary_index_html_end");
@@ -181,6 +214,7 @@ static void snapshot_dashboard_state(const dashboard_state_t *state);
 static bool read_dashboard_state_snapshot(dashboard_state_t *out);
 static void build_runtime_dashboard_state(dashboard_state_t *state);
 static void fill_smoke_test_sensor_state(dashboard_state_t *state);
+static void local_menu_run_smoke_demo(const dashboard_state_t *state);
 
 static const glyph3x5_t kFont3x5[] = {
     {' ', {0x0, 0x0, 0x0, 0x0, 0x0}}, {'%', {0x5, 0x1, 0x2, 0x4, 0x5}},
@@ -570,6 +604,138 @@ static bool read_dashboard_state_snapshot(dashboard_state_t *out) {
   }
   portEXIT_CRITICAL(&s_dashboard_state_lock);
   return valid;
+}
+
+static int menu_highlight_target_y_q8(int index) {
+  const int row_y[] = {36, 54, 72, 90, 108};
+  int safe_index = clamp_int(index, 0, LOCAL_SCREEN_COUNT - 1);
+  return row_y[safe_index] << 8;
+}
+
+static local_menu_state_t local_menu_snapshot(void) {
+  local_menu_state_t snapshot;
+
+  portENTER_CRITICAL(&s_local_menu_lock);
+  snapshot = s_local_menu;
+  portEXIT_CRITICAL(&s_local_menu_lock);
+  return snapshot;
+}
+
+static void local_menu_tick(void) {
+  int target_y_q8;
+  int diff;
+  int accel_q8;
+  int next_y_q8;
+
+  portENTER_CRITICAL(&s_local_menu_lock);
+  target_y_q8 = menu_highlight_target_y_q8(s_local_menu.selected_index);
+  if (s_local_menu.highlight_y_q8 == 0) {
+    s_local_menu.highlight_y_q8 = target_y_q8;
+    s_local_menu.highlight_velocity_q8 = 0;
+  } else {
+    diff = target_y_q8 - s_local_menu.highlight_y_q8;
+    if (abs(diff) <= 2 && abs(s_local_menu.highlight_velocity_q8) <= 2) {
+      s_local_menu.highlight_y_q8 = target_y_q8;
+      s_local_menu.highlight_velocity_q8 = 0;
+    } else {
+      accel_q8 = diff / 3;
+      if (accel_q8 == 0) {
+        accel_q8 = (diff > 0) ? 1 : -1;
+      }
+      s_local_menu.highlight_velocity_q8 += accel_q8;
+      s_local_menu.highlight_velocity_q8 =
+          (s_local_menu.highlight_velocity_q8 * 27) / 32;
+      s_local_menu.highlight_velocity_q8 =
+          clamp_int(s_local_menu.highlight_velocity_q8, -520, 520);
+      next_y_q8 =
+          s_local_menu.highlight_y_q8 + s_local_menu.highlight_velocity_q8;
+
+      if ((diff > 0 && next_y_q8 > target_y_q8 &&
+           s_local_menu.highlight_velocity_q8 > 0) ||
+          (diff < 0 && next_y_q8 < target_y_q8 &&
+           s_local_menu.highlight_velocity_q8 < 0)) {
+        s_local_menu.highlight_y_q8 = target_y_q8;
+        s_local_menu.highlight_velocity_q8 = 0;
+      } else {
+        s_local_menu.highlight_y_q8 = next_y_q8;
+      }
+    }
+  }
+  s_local_menu.pulse_phase = (uint8_t)(s_local_menu.pulse_phase + 1);
+  portEXIT_CRITICAL(&s_local_menu_lock);
+}
+
+static void sanitize_display_text(const char *source, char *dest,
+                                  size_t dest_size) {
+  size_t write = 0;
+
+  if (dest == NULL || dest_size == 0) {
+    return;
+  }
+
+  if (source == NULL) {
+    dest[0] = '\0';
+    return;
+  }
+
+  while (source[0] != '\0' && write + 1 < dest_size) {
+    unsigned char ch = (unsigned char)*source++;
+    if (ch >= 'a' && ch <= 'z') {
+      ch = (unsigned char)(ch - ('a' - 'A'));
+    }
+
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == ' ' ||
+        ch == '-' || ch == '.' || ch == '/' || ch == ':') {
+      dest[write++] = (char)ch;
+    } else {
+      dest[write++] = '-';
+    }
+  }
+
+  dest[write] = '\0';
+}
+
+static void local_menu_run_smoke_demo(const dashboard_state_t *state) {
+#if APP_SENSOR_SMOKE_TEST && MENU_SMOKE_AUTOPLAY
+  int64_t now_us;
+  int64_t elapsed_ms;
+  int index;
+
+  if (state == NULL) {
+    return;
+  }
+
+  if (state->aqi < 5) {
+    if (s_menu_smoke_demo_started) {
+      portENTER_CRITICAL(&s_local_menu_lock);
+      s_local_menu.visible = false;
+      s_local_menu.selected_index = (int)s_local_menu.active_screen;
+      portEXIT_CRITICAL(&s_local_menu_lock);
+    }
+    s_menu_smoke_demo_started = false;
+    s_menu_smoke_demo_started_us = 0;
+    return;
+  }
+
+  now_us = esp_timer_get_time();
+  if (!s_menu_smoke_demo_started) {
+    s_menu_smoke_demo_started = true;
+    s_menu_smoke_demo_started_us = now_us;
+  }
+
+  elapsed_ms = (now_us - s_menu_smoke_demo_started_us) / 1000LL;
+  index = (int)((elapsed_ms / MENU_SMOKE_STEP_MS) % LOCAL_SCREEN_COUNT);
+
+  portENTER_CRITICAL(&s_local_menu_lock);
+  s_local_menu.visible = true;
+  s_local_menu.selected_index = index;
+  if (s_local_menu.highlight_y_q8 == 0) {
+    s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
+  }
+  portEXIT_CRITICAL(&s_local_menu_lock);
+#else
+  (void)state;
+#endif
 }
 
 static void fill_smoke_test_sensor_state(dashboard_state_t *state) {
@@ -2516,6 +2682,176 @@ static void draw_hybrid_overlay(const dashboard_state_t *state) {
   draw_hybrid_metric_card(116, 40, "HUMI", hum_text, "%", 2, false, COLOR_CYAN);
 }
 
+static void draw_local_header(const char *title, const char *subtitle) {
+  fb_clear(COLOR_BG);
+  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+  fb_fill_rect(5, 5, 150, 18, RGB565(3, 10, 18));
+  fb_draw_rect(5, 5, 150, 18, RGB565(24, 78, 126));
+  fb_fill_rect(6, 6, 46, 2, COLOR_CYAN);
+  fb_draw_text5x7(10, 10, title, COLOR_WHITE, 1);
+  fb_draw_text5x7(10, 26, subtitle, COLOR_MUTED, 1);
+}
+
+static void draw_monitor_screen(const dashboard_state_t *state) {
+  draw_hybrid_overlay(state);
+}
+
+static void draw_wifi_screen(void) {
+  char ssid_text[40];
+  char host_text[32];
+  char ip_text[24];
+  char mode_text[16];
+  char link_text[16];
+  const char *raw_ssid = s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE";
+  bool connected = wifi_link_is_up();
+
+  draw_local_header("WIFI CONFIG", "LOCAL PANEL");
+
+  sanitize_display_text(raw_ssid, ssid_text, sizeof(ssid_text));
+  sanitize_display_text(RUNTIME_MDNS_HOSTNAME ".LOCAL", host_text,
+                        sizeof(host_text));
+
+  if (s_wifi_sta_netif != NULL) {
+    esp_netif_ip_info_t ip_info = {0};
+    if (esp_netif_get_ip_info(s_wifi_sta_netif, &ip_info) == ESP_OK &&
+        ip_info.ip.addr != 0) {
+      snprintf(ip_text, sizeof(ip_text), IPSTR, IP2STR(&ip_info.ip));
+    } else {
+      strlcpy(ip_text, "NO IP", sizeof(ip_text));
+    }
+  } else {
+    strlcpy(ip_text, "NO IP", sizeof(ip_text));
+  }
+
+  strlcpy(mode_text, s_provisioning_portal_active ? "PORTAL" : "RUNTIME",
+          sizeof(mode_text));
+  strlcpy(link_text, connected ? "ONLINE" : "OFFLINE", sizeof(link_text));
+
+  draw_panel(6, 34, 148, 22, COLOR_CYAN);
+  fb_draw_text5x7(12, 40, "SSID", COLOR_MUTED, 1);
+  fb_draw_text5x7(58, 40, ssid_text, COLOR_WHITE, 1);
+
+  draw_panel(6, 60, 148, 22, COLOR_LIME);
+  fb_draw_text5x7(12, 66, "LINK", COLOR_MUTED, 1);
+  fb_draw_text5x7(58, 66, link_text, connected ? COLOR_LIME : COLOR_ORANGE, 1);
+  fb_draw_text5x7(102, 66, mode_text, COLOR_CYAN, 1);
+
+  draw_panel(6, 86, 148, 18, COLOR_YELLOW);
+  fb_draw_text5x7(12, 91, "HOST", COLOR_MUTED, 1);
+  fb_draw_text5x7(46, 91, host_text, COLOR_WHITE, 1);
+
+  draw_panel(6, 107, 148, 16, COLOR_ORANGE);
+  fb_draw_text5x7(12, 111, "IP", COLOR_MUTED, 1);
+  fb_draw_text5x7(34, 111, ip_text, COLOR_WHITE, 1);
+}
+
+static void draw_alarm_screen(void) {
+  draw_local_header("ALARM PANEL", "SAFE STUB");
+
+  draw_panel(6, 34, 148, 28, COLOR_ORANGE);
+  fb_draw_text5x7(12, 40, "ALARM 1", COLOR_MUTED, 1);
+  fb_draw_text5x7(88, 40, "06:30", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 50, "MODE DAILY", COLOR_CYAN, 1);
+
+  draw_panel(6, 67, 148, 24, COLOR_CYAN);
+  fb_draw_text5x7(12, 73, "ALARM 2", COLOR_MUTED, 1);
+  fb_draw_text5x7(88, 73, "21:00", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 82, "MODE IDLE", COLOR_MUTED, 1);
+
+  draw_panel(6, 96, 148, 27, COLOR_LIME);
+  fb_draw_text5x7(12, 102, "NEXT STEP", COLOR_MUTED, 1);
+  fb_draw_text5x7(12, 112, "SYNC WITH REAL RTC", COLOR_WHITE, 1);
+}
+
+static void draw_game_screen(void) {
+  draw_local_header("GAME HUB", "PLACEHOLDER");
+
+  draw_panel(6, 34, 148, 26, COLOR_CYAN);
+  fb_draw_text5x7(12, 40, "NEXT STEP", COLOR_MUTED, 1);
+  fb_draw_text5x7(78, 40, "MINI GAME", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 50, "SNAKE / TAP / REACT", COLOR_CYAN, 1);
+
+  draw_panel(6, 65, 148, 24, COLOR_ORANGE);
+  fb_draw_text5x7(12, 71, "INPUT", COLOR_MUTED, 1);
+  fb_draw_text5x7(60, 71, "USE BUTTON EVENT", COLOR_WHITE, 1);
+
+  draw_panel(6, 94, 148, 29, COLOR_LIME);
+  fb_draw_text5x7(12, 100, "STATUS", COLOR_MUTED, 1);
+  fb_draw_text5x7(12, 110, "RESERVED FOR GAME LOOP", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 118, "SAFE STUB FOR NOW", COLOR_CYAN, 1);
+}
+
+static void draw_memory_screen(void) {
+  fb_clear(COLOR_BG);
+  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+}
+
+static void draw_menu_overlay(const local_menu_state_t *menu) {
+  static const char *kMenuItems[LOCAL_SCREEN_COUNT] = {
+      "MONITOR", "WIFI CFG", "ALARM", "GAME", "MEMORY"};
+  int panel_x = 0;
+  int panel_y = 0;
+  int panel_w = TFT_WIDTH;
+  int panel_h = TFT_HEIGHT;
+  int highlight_y = menu->highlight_y_q8 >> 8;
+  int glow_y = highlight_y - 2;
+  int pulse = 6 + ((menu->pulse_phase >> 5) & 0x07);
+  int indicator_y = highlight_y + 5;
+
+  fb_clear(COLOR_BG);
+  fb_fill_rect(panel_x, panel_y, panel_w, panel_h, RGB565(0, 0, 0));
+  fb_draw_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(14, 44, 74));
+  fb_draw_rect(3, 3, TFT_WIDTH - 6, TFT_HEIGHT - 6, RGB565(8, 26, 42));
+  fb_fill_rect(12, 12, 54, 2, COLOR_CYAN);
+  fb_draw_text5x7(14, 20, "MAIN MENU", COLOR_WHITE, 2);
+
+  fb_fill_rect(16, glow_y, 128, 20, RGB565(2, 10, 18));
+  fb_fill_rect(17, highlight_y - 1, 126, 18, RGB565(3, 14, 24));
+  fb_fill_rect(18, highlight_y, 124, 16, RGB565(4, 18, 30));
+  fb_draw_rect(18, highlight_y, 124, 16, COLOR_CYAN);
+  fb_draw_rect(19, highlight_y + 1, 122, 14, RGB565(24, 130, 196));
+  fb_fill_rect(18, highlight_y, pulse, 16, COLOR_CYAN);
+  fb_fill_rect(28, indicator_y, 5, 5, COLOR_LIME);
+
+  for (int i = 0; i < LOCAL_SCREEN_COUNT; ++i) {
+    int row_y = 36 + (i * 18);
+    int distance = abs((row_y << 8) - menu->highlight_y_q8) >> 8;
+    int x_nudge = clamp_int((16 - distance) / 2, 0, 6);
+    uint16_t text_color =
+        (distance <= 6) ? COLOR_WHITE : COLOR_MUTED;
+    fb_draw_text5x7(42 + x_nudge, row_y + 4, kMenuItems[i], text_color, 1);
+  }
+}
+
+static void draw_local_screen(const dashboard_state_t *state) {
+  local_menu_state_t menu = local_menu_snapshot();
+
+  switch (menu.active_screen) {
+  case LOCAL_SCREEN_MONITOR:
+    draw_monitor_screen(state);
+    break;
+  case LOCAL_SCREEN_WIFI:
+    draw_wifi_screen();
+    break;
+  case LOCAL_SCREEN_ALARM:
+    draw_alarm_screen();
+    break;
+  case LOCAL_SCREEN_GAME:
+    draw_game_screen();
+    break;
+  case LOCAL_SCREEN_MEMORY:
+    draw_memory_screen();
+    break;
+  default:
+    draw_monitor_screen(state);
+    break;
+  }
+
+  if (menu.visible) {
+    draw_menu_overlay(&menu);
+  }
+}
+
 static void draw_boot_screen(int percent, const char *status) {
   char percent_text[8];
   const int shell_x = 6;
@@ -2738,6 +3074,9 @@ static void build_runtime_dashboard_state(dashboard_state_t *state) {
 }
 
 void app_main(void) {
+  dashboard_state_t state = {0};
+  int64_t last_sensor_refresh_us = 0;
+
   ESP_LOGI(TAG, "Starting ST7735 dashboard demo");
   lcd_init();
 
@@ -2766,17 +3105,28 @@ void app_main(void) {
   lcd_present_framebuffer();
   vTaskDelay(pdMS_TO_TICKS(220));
 
+  build_runtime_dashboard_state(&state);
+  snapshot_dashboard_state(&state);
+  last_sensor_refresh_us = esp_timer_get_time();
+
   while (true) {
-    dashboard_state_t state = {0};
-    build_runtime_dashboard_state(&state);
-    snapshot_dashboard_state(&state);
+    int64_t now_us = esp_timer_get_time();
+    if ((now_us - last_sensor_refresh_us) >=
+        (DASHBOARD_SENSOR_REFRESH_MS * 1000LL)) {
+      build_runtime_dashboard_state(&state);
+      snapshot_dashboard_state(&state);
+      last_sensor_refresh_us = now_us;
+    }
+
+    local_menu_run_smoke_demo(&state);
+    local_menu_tick();
 
 #if SHOW_BITMAP_UI
-    draw_hybrid_overlay(&state);
+    draw_local_screen(&state);
 #else
     draw_dashboard(&state);
 #endif
     lcd_present_framebuffer();
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_FRAME_INTERVAL_MS));
   }
 }
