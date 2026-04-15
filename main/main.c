@@ -862,15 +862,12 @@ static esp_err_t config_telemetry_get_handler(httpd_req_t *req) {
     build_demo_state(&state);
   }
 
-  char clock_text[32] = {0};
-  strftime(clock_text, sizeof(clock_text), "%Y-%m-%d %H:%M:%S", &state.clock);
-
   char payload[512];
   snprintf(payload, sizeof(payload),
            "{\"ok\":true,\"aqi\":%d,\"eco2\":%d,\"tvoc\":%d,\"ensValidity\":%d,"
-           "\"tempC\":%.1f,\"humidity\":%d,\"clock\":\"%s\"}",
+           "\"tempC\":%.1f,\"humidity\":%d}",
            state.aqi, state.eco2_ppm, state.tvoc_ppb, state.ens_validity,
-           state.temp_tenths_c / 10.0f, state.humidity_pct, clock_text);
+           state.temp_tenths_c / 10.0f, state.humidity_pct);
   return send_json_response(req, "200 OK", payload);
 }
 

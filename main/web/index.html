@@ -48,32 +48,35 @@
             <p class="hint">Realtime values from the running device.</p>
           </header>
 
-          <div class="metric-grid">
-            <article class="metric-card">
-              <p class="metric-label">AQI</p>
-              <p id="metricAqi" class="metric-value">-</p>
+          <section class="monitor-layout">
+            <article id="metricAqiCard" class="metric-card metric-card-hero">
+              <div class="metric-head">
+                <p class="metric-label">Air Quality Index</p>
+                <span id="metricAqiState" class="metric-chip">Waiting</span>
+              </div>
+              <p id="metricAqi" class="metric-value metric-value-hero">-</p>
+              <p class="metric-note">Primary comfort signal for the room right now.</p>
             </article>
-            <article class="metric-card">
-              <p class="metric-label">eCO2 (ppm)</p>
-              <p id="metricEco2" class="metric-value">-</p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">TVOC (ppb)</p>
-              <p id="metricTvoc" class="metric-value">-</p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Temperature</p>
-              <p id="metricTemp" class="metric-value">-</p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Humidity</p>
-              <p id="metricHumidity" class="metric-value">-</p>
-            </article>
-            <article class="metric-card">
-              <p class="metric-label">Clock</p>
-              <p id="metricClock" class="metric-value small">-</p>
-            </article>
-          </div>
+
+            <div class="metric-grid">
+              <article class="metric-card">
+                <p class="metric-label">eCO2 (ppm)</p>
+                <p id="metricEco2" class="metric-value">-</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">TVOC (ppb)</p>
+                <p id="metricTvoc" class="metric-value">-</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">Temperature</p>
+                <p id="metricTemp" class="metric-value">-</p>
+              </article>
+              <article class="metric-card">
+                <p class="metric-label">Humidity</p>
+                <p id="metricHumidity" class="metric-value">-</p>
+              </article>
+            </div>
+          </section>
         </section>
 
         <section class="tab-panel" data-panel="wifi">

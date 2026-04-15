@@ -6,11 +6,12 @@ const credSource = document.getElementById("credSource");
 const runtimeIp = document.getElementById("runtimeIp");
 
 const metricAqi = document.getElementById("metricAqi");
+const metricAqiCard = document.getElementById("metricAqiCard");
+const metricAqiState = document.getElementById("metricAqiState");
 const metricEco2 = document.getElementById("metricEco2");
 const metricTvoc = document.getElementById("metricTvoc");
 const metricTemp = document.getElementById("metricTemp");
 const metricHumidity = document.getElementById("metricHumidity");
-const metricClock = document.getElementById("metricClock");
 
 const scanList = document.getElementById("scanList");
 const scanBtn = document.getElementById("scanBtn");
@@ -65,11 +66,12 @@ function ensureUiBindings() {
     [credSource, "credSource"],
     [runtimeIp, "runtimeIp"],
     [metricAqi, "metricAqi"],
+    [metricAqiCard, "metricAqiCard"],
+    [metricAqiState, "metricAqiState"],
     [metricEco2, "metricEco2"],
     [metricTvoc, "metricTvoc"],
     [metricTemp, "metricTemp"],
     [metricHumidity, "metricHumidity"],
-    [metricClock, "metricClock"],
     [scanList, "scanList"],
     [scanBtn, "scanBtn"],
     [enablePortalBtn, "enablePortalBtn"],
@@ -113,6 +115,19 @@ async function fetchJson(url, options) {
   return payload;
 }
 
+function describeAqi(aqi) {
+  if (aqi == null || Number.isNaN(Number(aqi))) {
+    return { label: "Waiting", tone: "idle" };
+  }
+
+  const level = Number(aqi);
+  if (level <= 1) return { label: "Level 1 · Excellent", tone: "good" };
+  if (level === 2) return { label: "Level 2 · Good", tone: "good" };
+  if (level === 3) return { label: "Level 3 · Moderate", tone: "mid" };
+  if (level === 4) return { label: "Level 4 · Poor", tone: "warn" };
+  return { label: "Level 5 · Unhealthy", tone: "bad" };
+}
+
 function switchTab(tabName) {
   tabButtons.forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === tabName);
@@ -154,19 +169,22 @@ async function loadState() {
 async function loadTelemetry() {
   try {
     const telemetry = await fetchJson("/api/telemetry");
+    const aqiView = describeAqi(telemetry.aqi);
     metricAqi.textContent = telemetry.aqi ?? "-";
+    metricAqiState.textContent = aqiView.label;
+    metricAqiCard.dataset.tone = aqiView.tone;
     metricEco2.textContent = telemetry.eco2 ?? "-";
     metricTvoc.textContent = telemetry.tvoc ?? "-";
     metricTemp.textContent = telemetry.tempC != null ? `${telemetry.tempC.toFixed(1)}°C` : "-";
     metricHumidity.textContent = telemetry.humidity != null ? `${telemetry.humidity}%` : "-";
-    metricClock.textContent = telemetry.clock || "-";
   } catch {
     metricAqi.textContent = "-";
+    metricAqiState.textContent = "Waiting";
+    metricAqiCard.dataset.tone = "idle";
     metricEco2.textContent = "-";
     metricTvoc.textContent = "-";
     metricTemp.textContent = "-";
     metricHumidity.textContent = "-";
-    metricClock.textContent = "-";
   }
 }
 
