@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS "main.c"
          "app/app_core.c"
+         "app/app_state_machine.c"
          "app/dashboard_state.c"
          "drivers/display_hal.c"
          "services/captive_dns.c"
