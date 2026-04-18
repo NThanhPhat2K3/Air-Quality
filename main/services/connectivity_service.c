@@ -11,6 +11,7 @@
 #include "dashboard_state.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "freertos/portmacro.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -105,6 +106,7 @@ static int s_wifi_connect_fail_cycles;
 static int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
 static char s_provisioning_ap_ssid[33];
+static portMUX_TYPE s_connectivity_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 extern const uint8_t web_index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t web_index_html_end[] asm("_binary_index_html_end");
@@ -142,6 +144,7 @@ static bool is_placeholder_credentials(const char *ssid, const char *password) {
 
 static void wifi_set_credentials_cache(const char *ssid, const char *password,
                                        bool hidden, bool from_nvs) {
+  portENTER_CRITICAL(&s_connectivity_state_lock);
   memset(&s_wifi_credentials, 0, sizeof(s_wifi_credentials));
   if (ssid != NULL) {
     strlcpy(s_wifi_credentials.ssid, ssid, sizeof(s_wifi_credentials.ssid));
@@ -153,6 +156,7 @@ static void wifi_set_credentials_cache(const char *ssid, const char *password,
   s_wifi_credentials.hidden = hidden;
   s_wifi_credentials.valid = s_wifi_credentials.ssid[0] != '\0';
   s_wifi_credentials.from_nvs = from_nvs;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
 }
 
 static bool wifi_load_credentials_from_nvs(void) {
@@ -414,7 +418,7 @@ static bool form_get_value(const char *body, const char *key, char *out,
     size_t token_len =
         separator != NULL ? (size_t)(separator - cursor) : strlen(cursor);
 
-    if (token_len > key_len + 1 && strncmp(cursor, key, key_len) == 0 &&
+    if (token_len >= key_len + 1 && strncmp(cursor, key, key_len) == 0 &&
         cursor[key_len] == '=') {
       size_t value_len = token_len - key_len - 1;
       if (value_len >= out_len) {
@@ -653,8 +657,15 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
   char escaped_ap_ssid[160];
   char runtime_ip[20] = "";
   char payload[WIFI_STATE_JSON_MAX_LEN];
+  wifi_credentials_t creds_snap;
+  bool portal_snap;
 
-  json_escape(s_wifi_credentials.valid ? s_wifi_credentials.ssid : "",
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  creds_snap = s_wifi_credentials;
+  portal_snap = s_provisioning_portal_active;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+
+  json_escape(creds_snap.valid ? creds_snap.ssid : "",
               escaped_ssid, sizeof(escaped_ssid));
   json_escape(s_provisioning_ap_ssid, escaped_ap_ssid, sizeof(escaped_ap_ssid));
 
@@ -671,15 +682,15 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
            "\"currentSsid\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
            "\"hiddenSsid\":%s,\"canStartPortal\":%s,\"runtimeIp\":\"%s\","
            "\"runtimeHost\":\"%s.local\"}",
-           s_provisioning_portal_active ? "provisioning" : "runtime",
+           portal_snap ? "provisioning" : "runtime",
            connectivity_service_is_wifi_connected() ? "true" : "false",
-           s_provisioning_portal_active ? "true" : "false",
-           s_wifi_credentials.valid
-               ? (s_wifi_credentials.from_nvs ? "nvs" : "build")
+           portal_snap ? "true" : "false",
+           creds_snap.valid
+               ? (creds_snap.from_nvs ? "nvs" : "build")
                : "none",
            escaped_ssid, escaped_ap_ssid, WIFI_PROVISIONING_AP_PASS,
-           s_wifi_credentials.hidden ? "true" : "false",
-           s_wifi_credentials.valid ? "true" : "false", runtime_ip,
+           creds_snap.hidden ? "true" : "false",
+           creds_snap.valid ? "true" : "false", runtime_ip,
            CONNECTIVITY_RUNTIME_HOSTNAME);
 
   return send_json_response(req, "200 OK", payload);
@@ -1678,7 +1689,9 @@ static bool run_clock_sync_cycle(void) {
   s_wifi_target_missing_cycles = 0;
 
   synced = sync_time_tphcm();
+  portENTER_CRITICAL(&s_connectivity_state_lock);
   s_time_synced = s_time_synced || synced || is_system_time_valid();
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
   return synced;
 }
 
@@ -1697,7 +1710,9 @@ static void clock_sync_task(void *arg) {
     if (s_wifi_event_group != NULL) {
       EventBits_t bits = CLOCK_SYNC_DONE_BIT;
       if (synced || is_system_time_valid()) {
+        portENTER_CRITICAL(&s_connectivity_state_lock);
         s_time_synced = true;
+        portEXIT_CRITICAL(&s_connectivity_state_lock);
         bits |= CLOCK_SYNC_OK_BIT;
       }
       xEventGroupSetBits(s_wifi_event_group, bits);
@@ -1747,14 +1762,24 @@ void connectivity_service_setup_and_clock(void) {
       s_wifi_event_group, CLOCK_SYNC_DONE_BIT | CLOCK_SYNC_OK_BIT, pdFALSE,
       pdFALSE, pdMS_TO_TICKS(CLOCK_SYNC_INITIAL_WAIT_MS));
   if ((bits & CLOCK_SYNC_OK_BIT) != 0 || is_system_time_valid()) {
+    portENTER_CRITICAL(&s_connectivity_state_lock);
     s_time_synced = true;
+    portEXIT_CRITICAL(&s_connectivity_state_lock);
   }
 }
 
-bool connectivity_service_is_time_synced(void) { return s_time_synced; }
+bool connectivity_service_is_time_synced(void) {
+  bool synced;
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  synced = s_time_synced;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+  return synced;
+}
 
 void connectivity_service_set_time_synced(bool time_synced) {
+  portENTER_CRITICAL(&s_connectivity_state_lock);
   s_time_synced = time_synced;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
 }
 
 void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {
@@ -1765,10 +1790,13 @@ void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {
   memset(out, 0, sizeof(*out));
   wifi_refresh_credentials_cache();
   out->connected = connectivity_service_is_wifi_connected();
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
   out->provisioning_portal_active = s_provisioning_portal_active;
   out->credentials_valid = s_wifi_credentials.valid;
   strlcpy(out->ssid, s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE",
           sizeof(out->ssid));
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
 
   if (s_wifi_sta_netif != NULL) {
     esp_netif_ip_info_t ip_info = {0};
