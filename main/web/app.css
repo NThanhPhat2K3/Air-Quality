@@ -420,6 +420,28 @@ h3 {
   color: var(--muted);
 }
 
+.check-field {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.check-field input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent-2);
+  box-shadow: none;
+}
+
+.check-field span {
+  color: var(--muted);
+}
+
 input {
   border: 1px solid rgba(101, 156, 196, 0.66);
   background: rgba(10, 28, 45, 0.92);

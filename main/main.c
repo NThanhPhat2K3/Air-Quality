@@ -7,15 +7,14 @@
 #include <string.h>
 #include <time.h>
 
+#include "captive_dns.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "captive_dns.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "mdns.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_system.h"
@@ -25,6 +24,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "mdns.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -59,7 +59,8 @@
   (uint16_t)((((r)&0xF8) << 8) | (((g)&0xFC) << 3) | ((b) >> 3))
 // 1 = use hybrid runtime UI (black background + data cards).
 #define SHOW_BITMAP_UI 1
-// 1 = use stubbed sensor values for bring-up/smoke testing before real hardware.
+// 1 = use stubbed sensor values for bring-up/smoke testing before real
+// hardware.
 #define APP_SENSOR_SMOKE_TEST 1
 // Only used when APP_SENSOR_SMOKE_TEST=1.
 // 1 = cycle stub AQI values through all thresholds so the UI can be reviewed.
@@ -91,6 +92,7 @@
 #define WIFI_CREDENTIALS_NAMESPACE "wifi_cfg"
 #define WIFI_CREDENTIALS_KEY_SSID "ssid"
 #define WIFI_CREDENTIALS_KEY_PASS "pass"
+#define WIFI_CREDENTIALS_KEY_HIDDEN "hidden"
 #define WIFI_PROVISIONING_AP_PASS "setup123"
 #define WIFI_PROVISIONING_MAX_CONN 4
 #define WIFI_PROVISIONING_BODY_MAX_LEN 256
@@ -100,6 +102,7 @@
 #define WIFI_SCAN_JSON_MAX_LEN 4096
 #define WIFI_STATE_JSON_MAX_LEN 1024
 #define WIFI_CONNECT_FAIL_PORTAL_THRESHOLD 3
+#define WIFI_TARGET_MISSING_PORTAL_THRESHOLD 2
 #define RUNTIME_MDNS_HOSTNAME "aqnode"
 #define RUNTIME_MDNS_INSTANCE "AQ Node"
 
@@ -132,9 +135,22 @@ typedef struct {
 typedef struct {
   char ssid[33];
   char password[65];
+  bool hidden;
   bool valid;
   bool from_nvs;
 } wifi_credentials_t;
+
+typedef enum {
+  WIFI_TARGET_SCAN_FOUND = 0,
+  WIFI_TARGET_SCAN_NOT_FOUND,
+  WIFI_TARGET_SCAN_ERROR,
+} wifi_target_scan_result_t;
+
+typedef enum {
+  WIFI_CONNECT_RESULT_CONNECTED = 0,
+  WIFI_CONNECT_RESULT_TARGET_NOT_FOUND,
+  WIFI_CONNECT_RESULT_FAILED,
+} wifi_connect_result_t;
 
 typedef struct {
   uint8_t cmd;
@@ -181,6 +197,7 @@ static bool s_restart_scheduled;
 static bool s_mdns_ready;
 static int64_t s_last_credentials_write_us;
 static int s_wifi_connect_fail_cycles;
+static int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
 static char s_provisioning_ap_ssid[33];
 static dashboard_state_t s_latest_dashboard_state;
@@ -210,6 +227,7 @@ static void wifi_refresh_credentials_cache(void);
 static bool start_provisioning_portal(void);
 static void fill_sta_wifi_config(wifi_config_t *wifi_config);
 static void ensure_mdns_service(void);
+static wifi_target_scan_result_t wifi_scan_for_target_ssid(void);
 static void snapshot_dashboard_state(const dashboard_state_t *state);
 static bool read_dashboard_state_snapshot(dashboard_state_t *out);
 static void build_runtime_dashboard_state(dashboard_state_t *state);
@@ -387,7 +405,7 @@ static bool is_placeholder_credentials(const char *ssid, const char *password) {
 }
 
 static void wifi_set_credentials_cache(const char *ssid, const char *password,
-                                       bool from_nvs) {
+                                       bool hidden, bool from_nvs) {
   memset(&s_wifi_credentials, 0, sizeof(s_wifi_credentials));
   if (ssid != NULL) {
     strlcpy(s_wifi_credentials.ssid, ssid, sizeof(s_wifi_credentials.ssid));
@@ -396,19 +414,22 @@ static void wifi_set_credentials_cache(const char *ssid, const char *password,
     strlcpy(s_wifi_credentials.password, password,
             sizeof(s_wifi_credentials.password));
   }
+  s_wifi_credentials.hidden = hidden;
   s_wifi_credentials.valid = s_wifi_credentials.ssid[0] != '\0';
   s_wifi_credentials.from_nvs = from_nvs;
 }
 
 static bool wifi_load_credentials_from_nvs(void) {
   nvs_handle_t nvs_handle;
-  esp_err_t ret = nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READONLY, &nvs_handle);
+  esp_err_t ret =
+      nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READONLY, &nvs_handle);
   if (ret != ESP_OK) {
     return false;
   }
 
   char ssid[sizeof(s_wifi_credentials.ssid)] = {0};
   char password[sizeof(s_wifi_credentials.password)] = {0};
+  uint8_t hidden = 0;
   size_t ssid_len = sizeof(ssid);
   size_t password_len = sizeof(password);
   bool loaded = false;
@@ -428,13 +449,22 @@ static bool wifi_load_credentials_from_nvs(void) {
     return false;
   }
 
-  wifi_set_credentials_cache(ssid, password, true);
+  ret = nvs_get_u8(nvs_handle, WIFI_CREDENTIALS_KEY_HIDDEN, &hidden);
+  if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    hidden = 0;
+  } else if (ret != ESP_OK) {
+    nvs_close(nvs_handle);
+    return false;
+  }
+
+  wifi_set_credentials_cache(ssid, password, hidden != 0, true);
   loaded = true;
   nvs_close(nvs_handle);
   return loaded;
 }
 
-static bool wifi_credentials_equal(const char *ssid, const char *password) {
+static bool wifi_credentials_equal(const char *ssid, const char *password,
+                                   bool hidden) {
   const char *safe_password = password != NULL ? password : "";
   if (ssid == NULL || ssid[0] == '\0') {
     return false;
@@ -444,11 +474,12 @@ static bool wifi_credentials_equal(const char *ssid, const char *password) {
     return false;
   }
   return strcmp(s_wifi_credentials.ssid, ssid) == 0 &&
-         strcmp(s_wifi_credentials.password, safe_password) == 0;
+         strcmp(s_wifi_credentials.password, safe_password) == 0 &&
+         s_wifi_credentials.hidden == hidden;
 }
 
 static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
-                                              const char *password,
+                                              const char *password, bool hidden,
                                               bool *did_write) {
   const char *safe_password = password != NULL ? password : "";
   int64_t now_us = esp_timer_get_time();
@@ -459,7 +490,7 @@ static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
   if (ssid == NULL || ssid[0] == '\0') {
     return ESP_ERR_INVALID_ARG;
   }
-  if (wifi_credentials_equal(ssid, safe_password)) {
+  if (wifi_credentials_equal(ssid, safe_password, hidden)) {
     ESP_LOGI(TAG, "Credentials unchanged, skip NVS write");
     return ESP_OK;
   }
@@ -471,7 +502,8 @@ static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
   }
 
   nvs_handle_t nvs_handle;
-  esp_err_t ret = nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  esp_err_t ret =
+      nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READWRITE, &nvs_handle);
   if (ret != ESP_OK) {
     return ret;
   }
@@ -482,13 +514,16 @@ static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
                       password != NULL ? password : "");
   }
   if (ret == ESP_OK) {
+    ret = nvs_set_u8(nvs_handle, WIFI_CREDENTIALS_KEY_HIDDEN, hidden ? 1 : 0);
+  }
+  if (ret == ESP_OK) {
     ret = nvs_commit(nvs_handle);
   }
   nvs_close(nvs_handle);
 
   if (ret == ESP_OK) {
     s_last_credentials_write_us = now_us;
-    wifi_set_credentials_cache(ssid, safe_password, true);
+    wifi_set_credentials_cache(ssid, safe_password, hidden, true);
     s_wifi_credentials_loaded = true;
     s_provisioning_portal_active = false;
     if (did_write != NULL) {
@@ -511,11 +546,11 @@ static void wifi_refresh_credentials_cache(void) {
   }
 
   if (!is_placeholder_credentials(WIFI_SSID, WIFI_PASS)) {
-    wifi_set_credentials_cache(WIFI_SSID, WIFI_PASS, false);
+    wifi_set_credentials_cache(WIFI_SSID, WIFI_PASS, false, false);
     ESP_LOGI(TAG, "Wi-Fi credentials loaded from compile-time config (ssid=%s)",
              s_wifi_credentials.ssid);
   } else {
-    wifi_set_credentials_cache("", "", false);
+    wifi_set_credentials_cache("", "", false, false);
     ESP_LOGW(TAG, "No Wi-Fi credentials configured; start provisioning portal");
   }
   s_wifi_credentials_loaded = true;
@@ -797,8 +832,8 @@ static void schedule_delayed_restart(void) {
     return;
   }
   s_restart_scheduled = true;
-  BaseType_t task_ok = xTaskCreate(delayed_restart_task, "cfg_restart", 2048,
-                                   NULL, 5, NULL);
+  BaseType_t task_ok =
+      xTaskCreate(delayed_restart_task, "cfg_restart", 2048, NULL, 5, NULL);
   if (task_ok != pdPASS) {
     s_restart_scheduled = false;
     ESP_LOGE(TAG, "Failed to schedule delayed restart");
@@ -821,10 +856,12 @@ static void url_decode_inplace(char *value) {
 
     if (*read == '%' && isxdigit((unsigned char)read[1]) &&
         isxdigit((unsigned char)read[2])) {
-      int hi = isdigit((unsigned char)read[1]) ? (read[1] - '0')
-                                               : (tolower((unsigned char)read[1]) - 'a' + 10);
-      int lo = isdigit((unsigned char)read[2]) ? (read[2] - '0')
-                                               : (tolower((unsigned char)read[2]) - 'a' + 10);
+      int hi = isdigit((unsigned char)read[1])
+                   ? (read[1] - '0')
+                   : (tolower((unsigned char)read[1]) - 'a' + 10);
+      int lo = isdigit((unsigned char)read[2])
+                   ? (read[2] - '0')
+                   : (tolower((unsigned char)read[2]) - 'a' + 10);
       *write++ = (char)((hi << 4) | lo);
       read += 3;
       continue;
@@ -864,6 +901,17 @@ static bool form_get_value(const char *body, const char *key, char *out,
   }
 
   return false;
+}
+
+static bool form_value_is_truthy(const char *body, const char *key) {
+  char value[16] = {0};
+
+  if (!form_get_value(body, key, value, sizeof(value))) {
+    return false;
+  }
+
+  return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+         strcmp(value, "on") == 0 || strcmp(value, "yes") == 0;
 }
 
 static bool has_control_chars(const char *value) {
@@ -1036,7 +1084,8 @@ static esp_err_t config_captive_redirect_get_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/plain; charset=utf-8");
   set_common_http_headers(req);
   httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
-  return httpd_resp_send(req, "Redirecting to setup portal", HTTPD_RESP_USE_STRLEN);
+  return httpd_resp_send(req, "Redirecting to setup portal",
+                         HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t config_state_get_handler(httpd_req_t *req) {
@@ -1060,7 +1109,8 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
            "{\"ok\":true,\"mode\":\"%s\",\"connected\":%s,"
            "\"provisioning\":%s,\"credentialSource\":\"%s\","
            "\"currentSsid\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
-           "\"canStartPortal\":%s,\"runtimeIp\":\"%s\",\"runtimeHost\":\"%s.local\"}",
+           "\"hiddenSsid\":%s,\"canStartPortal\":%s,\"runtimeIp\":\"%s\","
+           "\"runtimeHost\":\"%s.local\"}",
            s_provisioning_portal_active ? "provisioning" : "runtime",
            wifi_link_is_up() ? "true" : "false",
            s_provisioning_portal_active ? "true" : "false",
@@ -1068,6 +1118,7 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
                ? (s_wifi_credentials.from_nvs ? "nvs" : "build")
                : "none",
            escaped_ssid, escaped_ap_ssid, WIFI_PROVISIONING_AP_PASS,
+           s_wifi_credentials.hidden ? "true" : "false",
            s_wifi_credentials.valid ? "true" : "false", runtime_ip,
            RUNTIME_MDNS_HOSTNAME);
 
@@ -1184,7 +1235,8 @@ static esp_err_t config_scan_get_handler(httpd_req_t *req) {
                              "Out of memory");
   }
 
-  int written = snprintf(payload, WIFI_SCAN_JSON_MAX_LEN, "{\"ok\":true,\"items\":[");
+  int written =
+      snprintf(payload, WIFI_SCAN_JSON_MAX_LEN, "{\"ok\":true,\"items\":[");
   if (written < 0 || (size_t)written >= WIFI_SCAN_JSON_MAX_LEN) {
     free(seen_ssids);
     free(payload);
@@ -1225,9 +1277,10 @@ static esp_err_t config_scan_get_handler(httpd_req_t *req) {
         payload + written, WIFI_SCAN_JSON_MAX_LEN - (size_t)written,
         "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":\"%s\",\"secure\":%s}",
         visible_count > 0 ? "," : "", escaped_ssid, ap_records[i].rssi,
-        escaped_auth, ap_records[i].authmode == WIFI_AUTH_OPEN ? "false"
-                                                                : "true");
-    if (append < 0 || (size_t)append >= WIFI_SCAN_JSON_MAX_LEN - (size_t)written) {
+        escaped_auth,
+        ap_records[i].authmode == WIFI_AUTH_OPEN ? "false" : "true");
+    if (append < 0 ||
+        (size_t)append >= WIFI_SCAN_JSON_MAX_LEN - (size_t)written) {
       free(seen_ssids);
       free(payload);
       free(ap_records);
@@ -1238,8 +1291,9 @@ static esp_err_t config_scan_get_handler(httpd_req_t *req) {
     visible_count++;
   }
 
-  int tail = snprintf(payload + written, WIFI_SCAN_JSON_MAX_LEN - (size_t)written,
-                      "],\"count\":%d}", visible_count);
+  int tail =
+      snprintf(payload + written, WIFI_SCAN_JSON_MAX_LEN - (size_t)written,
+               "],\"count\":%d}", visible_count);
   if (tail < 0 || (size_t)tail >= WIFI_SCAN_JSON_MAX_LEN - (size_t)written) {
     free(seen_ssids);
     free(payload);
@@ -1273,6 +1327,7 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
   char ssid[sizeof(s_wifi_credentials.ssid)] = {0};
   char password[sizeof(s_wifi_credentials.password)] = {0};
   bool has_ssid = form_get_value(body, "ssid", ssid, sizeof(ssid));
+  bool hidden = form_value_is_truthy(body, "hidden");
   form_get_value(body, "password", password, sizeof(password));
 
   size_t ssid_len = strlen(ssid);
@@ -1294,7 +1349,8 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
   }
 
   bool did_write = false;
-  esp_err_t ret = wifi_save_credentials_to_nvs(ssid, password, &did_write);
+  esp_err_t ret =
+      wifi_save_credentials_to_nvs(ssid, password, hidden, &did_write);
   if (ret == ESP_ERR_INVALID_STATE) {
     return send_json_message(req, "429 Too Many Requests", false,
                              "Please wait a bit before saving again");
@@ -1310,7 +1366,8 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
                              "Credentials unchanged. Flash write skipped.");
   }
 
-  ESP_LOGI(TAG, "Wi-Fi credentials saved (ssid=%s). Restarting...", ssid);
+  ESP_LOGI(TAG, "Wi-Fi credentials saved (ssid=%s, hidden=%d). Restarting...",
+           ssid, hidden);
   schedule_delayed_restart();
   return send_json_message(req, "200 OK", true,
                            "Saved. Device restarting now.");
@@ -1322,8 +1379,7 @@ static esp_err_t config_provisioning_start_post_handler(httpd_req_t *req) {
       return send_json_message(req, "500 Internal Server Error", false,
                                "Failed to start setup hotspot");
     }
-    return send_json_message(req, "200 OK", true,
-                             "Setup hotspot is active.");
+    return send_json_message(req, "200 OK", true, "Setup hotspot is active.");
   }
 
   if (!start_provisioning_portal()) {
@@ -1568,7 +1624,8 @@ static bool start_provisioning_portal(void) {
   s_wifi_should_connect = has_credentials;
   wifi_clear_status_bits();
 
-  esp_err_t ret = esp_wifi_set_mode(has_credentials ? WIFI_MODE_APSTA : WIFI_MODE_AP);
+  esp_err_t ret =
+      esp_wifi_set_mode(has_credentials ? WIFI_MODE_APSTA : WIFI_MODE_AP);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "esp_wifi_set_mode provisioning failed: %s",
              esp_err_to_name(ret));
@@ -1584,7 +1641,8 @@ static bool start_provisioning_portal(void) {
   if (has_credentials) {
     ret = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (ret != ESP_OK) {
-      ESP_LOGE(TAG, "esp_wifi_set_config(STA) failed: %s", esp_err_to_name(ret));
+      ESP_LOGE(TAG, "esp_wifi_set_config(STA) failed: %s",
+               esp_err_to_name(ret));
       return false;
     }
   }
@@ -1833,9 +1891,89 @@ static void fill_sta_wifi_config(wifi_config_t *wifi_config) {
   }
 }
 
-static bool wifi_start_and_wait_for_connection(void) {
+static wifi_target_scan_result_t wifi_scan_for_target_ssid(void) {
+  wifi_scan_config_t scan_config = {
+      .ssid = NULL,
+      .bssid = NULL,
+      .channel = 0,
+      .show_hidden = true,
+      .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+  };
+  wifi_ap_record_t *ap_records = NULL;
+  uint16_t ap_count = 0;
+  esp_err_t ret;
+  wifi_target_scan_result_t result = WIFI_TARGET_SCAN_NOT_FOUND;
+
   if (!wifi_credentials_configured()) {
-    return false;
+    return WIFI_TARGET_SCAN_ERROR;
+  }
+  if (s_wifi_credentials.hidden) {
+    ESP_LOGI(TAG, "Target SSID '%s' is marked hidden; skip visibility scan",
+             s_wifi_credentials.ssid);
+    return WIFI_TARGET_SCAN_ERROR;
+  }
+
+  ret = esp_wifi_scan_start(&scan_config, true);
+  if (ret == ESP_ERR_WIFI_STATE) {
+    esp_wifi_scan_stop();
+    ret = esp_wifi_scan_start(&scan_config, true);
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Target SSID scan start failed: %s", esp_err_to_name(ret));
+    return WIFI_TARGET_SCAN_ERROR;
+  }
+
+  ret = esp_wifi_scan_get_ap_num(&ap_count);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Target SSID scan count failed: %s", esp_err_to_name(ret));
+    return WIFI_TARGET_SCAN_ERROR;
+  }
+
+  if (ap_count == 0) {
+    ESP_LOGW(TAG, "No AP found while scanning for target SSID '%s'",
+             s_wifi_credentials.ssid);
+    return WIFI_TARGET_SCAN_NOT_FOUND;
+  }
+
+  if (ap_count > WIFI_SCAN_MAX_RESULTS) {
+    ap_count = WIFI_SCAN_MAX_RESULTS;
+  }
+
+  ap_records = calloc(ap_count, sizeof(wifi_ap_record_t));
+  if (ap_records == NULL) {
+    ESP_LOGW(TAG, "Target SSID scan allocation failed");
+    return WIFI_TARGET_SCAN_ERROR;
+  }
+
+  ret = esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Target SSID scan fetch failed: %s", esp_err_to_name(ret));
+    result = WIFI_TARGET_SCAN_ERROR;
+    goto cleanup;
+  }
+
+  for (uint16_t i = 0; i < ap_count; ++i) {
+    if (strncmp((const char *)ap_records[i].ssid, s_wifi_credentials.ssid,
+                sizeof(s_wifi_credentials.ssid)) == 0) {
+      ESP_LOGI(TAG, "Target SSID '%s' is visible (RSSI=%d)",
+               s_wifi_credentials.ssid, ap_records[i].rssi);
+      result = WIFI_TARGET_SCAN_FOUND;
+      goto cleanup;
+    }
+  }
+
+  ESP_LOGW(TAG, "Target SSID '%s' not visible in current scan",
+           s_wifi_credentials.ssid);
+  result = WIFI_TARGET_SCAN_NOT_FOUND;
+
+cleanup:
+  free(ap_records);
+  return result;
+}
+
+static wifi_connect_result_t wifi_start_and_wait_for_connection(void) {
+  if (!wifi_credentials_configured()) {
+    return WIFI_CONNECT_RESULT_FAILED;
   }
 
   if (s_wifi_event_group != NULL) {
@@ -1845,7 +1983,7 @@ static bool wifi_start_and_wait_for_connection(void) {
       s_provisioning_portal_active = false;
       ensure_runtime_config_server();
       ESP_LOGI(TAG, "Wi-Fi already connected, reuse existing link");
-      return true;
+      return WIFI_CONNECT_RESULT_CONNECTED;
     }
   }
 
@@ -1853,7 +1991,7 @@ static bool wifi_start_and_wait_for_connection(void) {
   fill_sta_wifi_config(&wifi_config);
 
   s_wifi_retry_num = 0;
-  s_wifi_should_connect = true;
+  s_wifi_should_connect = false;
   wifi_clear_status_bits();
   ESP_LOGI(TAG, "Start Wi-Fi connection flow");
 
@@ -1861,32 +1999,46 @@ static bool wifi_start_and_wait_for_connection(void) {
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
     s_wifi_should_connect = false;
-    return false;
+    return WIFI_CONNECT_RESULT_FAILED;
   }
 
   ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(ret));
     s_wifi_should_connect = false;
-    return false;
+    return WIFI_CONNECT_RESULT_FAILED;
   }
 
   ret = esp_wifi_start();
   if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
     ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
     s_wifi_should_connect = false;
-    return false;
+    return WIFI_CONNECT_RESULT_FAILED;
   }
   ensure_mdns_service();
   if (ret == ESP_ERR_WIFI_CONN) {
     ESP_LOGI(TAG, "esp_wifi_start skipped because Wi-Fi is already running");
   }
 
+  wifi_target_scan_result_t scan_result = wifi_scan_for_target_ssid();
+  if (scan_result == WIFI_TARGET_SCAN_NOT_FOUND) {
+    s_wifi_should_connect = false;
+    if (s_wifi_event_group != NULL) {
+      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    }
+    return WIFI_CONNECT_RESULT_TARGET_NOT_FOUND;
+  }
+  if (scan_result == WIFI_TARGET_SCAN_ERROR) {
+    ESP_LOGW(TAG,
+             "Target SSID scan was inconclusive; continue with STA connect");
+  }
+
+  s_wifi_should_connect = true;
   ret = esp_wifi_connect();
   if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
     ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(ret));
     s_wifi_should_connect = false;
-    return false;
+    return WIFI_CONNECT_RESULT_FAILED;
   }
   if (ret == ESP_ERR_WIFI_CONN) {
     ESP_LOGI(TAG, "esp_wifi_connect called while STA is already connecting");
@@ -1900,7 +2052,7 @@ static bool wifi_start_and_wait_for_connection(void) {
     s_provisioning_portal_active = false;
     ensure_runtime_config_server();
     ESP_LOGI(TAG, "Wi-Fi connected");
-    return true;
+    return WIFI_CONNECT_RESULT_CONNECTED;
   }
 
   if ((bits & WIFI_FAIL_BIT) != 0) {
@@ -1908,7 +2060,7 @@ static bool wifi_start_and_wait_for_connection(void) {
   } else {
     ESP_LOGW(TAG, "Wi-Fi connect timeout, keep auto-connect enabled");
   }
-  return false;
+  return WIFI_CONNECT_RESULT_FAILED;
 }
 
 static void schedule_clock_sync_retry(uint32_t delay_ms) {
@@ -1933,7 +2085,7 @@ static void clock_sync_timer_callback(TimerHandle_t timer) {
 }
 
 static bool run_clock_sync_cycle(void) {
-  bool connected = false;
+  wifi_connect_result_t connect_result = WIFI_CONNECT_RESULT_FAILED;
   bool synced = false;
 
   if (!wifi_service_init_once()) {
@@ -1942,6 +2094,7 @@ static bool run_clock_sync_cycle(void) {
 
   if (!wifi_credentials_configured()) {
     s_wifi_connect_fail_cycles = 0;
+    s_wifi_target_missing_cycles = 0;
     start_provisioning_portal();
     return false;
   }
@@ -1951,15 +2104,37 @@ static bool run_clock_sync_cycle(void) {
     return false;
   }
 
-  connected = wifi_start_and_wait_for_connection();
-  if (!connected) {
+  connect_result = wifi_start_and_wait_for_connection();
+  if (connect_result != WIFI_CONNECT_RESULT_CONNECTED) {
+    if (connect_result == WIFI_CONNECT_RESULT_TARGET_NOT_FOUND) {
+      s_wifi_target_missing_cycles++;
+      s_wifi_connect_fail_cycles = 0;
+      ESP_LOGW(TAG, "Configured SSID missing in scan (%d/%d)",
+               s_wifi_target_missing_cycles,
+               WIFI_TARGET_MISSING_PORTAL_THRESHOLD);
+      if (s_wifi_target_missing_cycles >=
+          WIFI_TARGET_MISSING_PORTAL_THRESHOLD) {
+        ESP_LOGW(TAG, "Configured SSID stayed missing across scans; switch to "
+                      "setup hotspot");
+        if (!s_provisioning_portal_active && start_provisioning_portal()) {
+          s_wifi_target_missing_cycles = 0;
+        } else if (!s_provisioning_portal_active) {
+          ESP_LOGE(TAG,
+                   "Failed to start setup hotspot after repeated scan miss");
+        }
+      }
+      return false;
+    }
+
+    s_wifi_target_missing_cycles = 0;
     if (!s_provisioning_portal_active) {
       s_wifi_connect_fail_cycles++;
       ESP_LOGW(TAG, "Wi-Fi connect cycle failed (%d/%d)",
                s_wifi_connect_fail_cycles, WIFI_CONNECT_FAIL_PORTAL_THRESHOLD);
       if (s_wifi_connect_fail_cycles >= WIFI_CONNECT_FAIL_PORTAL_THRESHOLD) {
-        ESP_LOGW(TAG,
-                 "Auto-enable setup hotspot after repeated connection failures");
+        ESP_LOGW(
+            TAG,
+            "Auto-enable setup hotspot after repeated connection failures");
         if (start_provisioning_portal()) {
           s_wifi_connect_fail_cycles = 0;
         } else {
@@ -1970,6 +2145,7 @@ static bool run_clock_sync_cycle(void) {
     return false;
   }
   s_wifi_connect_fail_cycles = 0;
+  s_wifi_target_missing_cycles = 0;
 
   synced = sync_time_tphcm();
   s_time_synced = s_time_synced || synced || is_system_time_valid();
@@ -2702,7 +2878,8 @@ static void draw_wifi_screen(void) {
   char ip_text[24];
   char mode_text[16];
   char link_text[16];
-  const char *raw_ssid = s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE";
+  const char *raw_ssid =
+      s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE";
   bool connected = wifi_link_is_up();
 
   draw_local_header("WIFI CONFIG", "LOCAL PANEL");
@@ -2817,8 +2994,7 @@ static void draw_menu_overlay(const local_menu_state_t *menu) {
     int row_y = 36 + (i * 18);
     int distance = abs((row_y << 8) - menu->highlight_y_q8) >> 8;
     int x_nudge = clamp_int((16 - distance) / 2, 0, 6);
-    uint16_t text_color =
-        (distance <= 6) ? COLOR_WHITE : COLOR_MUTED;
+    uint16_t text_color = (distance <= 6) ? COLOR_WHITE : COLOR_MUTED;
     fb_draw_text5x7(42 + x_nudge, row_y + 4, kMenuItems[i], text_color, 1);
   }
 }

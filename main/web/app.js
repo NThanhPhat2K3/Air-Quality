@@ -19,6 +19,7 @@ const enablePortalBtn = document.getElementById("enablePortalBtn");
 const wifiForm = document.getElementById("wifiForm");
 const ssidInput = document.getElementById("ssidInput");
 const passwordInput = document.getElementById("passwordInput");
+const hiddenInput = document.getElementById("hiddenInput");
 const saveBtn = document.getElementById("saveBtn");
 const statusText = document.getElementById("statusText");
 
@@ -78,6 +79,7 @@ function ensureUiBindings() {
     [wifiForm, "wifiForm"],
     [ssidInput, "ssidInput"],
     [passwordInput, "passwordInput"],
+    [hiddenInput, "hiddenInput"],
     [saveBtn, "saveBtn"],
     [alarmTime, "alarmTime"],
     [alarmMessage, "alarmMessage"],
@@ -164,6 +166,7 @@ async function loadState() {
   if (!ssidInput.value && state.currentSsid) {
     ssidInput.value = state.currentSsid;
   }
+  hiddenInput.checked = Boolean(state.hiddenSsid);
 }
 
 async function loadTelemetry() {
@@ -226,6 +229,7 @@ function renderNetworks(items) {
 
     button.addEventListener("click", () => {
       ssidInput.value = item.ssid;
+      hiddenInput.checked = false;
       if (!item.secure) {
         passwordInput.value = "";
       }
@@ -317,6 +321,7 @@ function bindUiEvents() {
 
     const ssid = ssidInput.value.trim();
     const password = passwordInput.value;
+    const hidden = hiddenInput.checked;
 
     if (!ssid) {
       setStatus("SSID cannot be empty.", "bad");
@@ -330,6 +335,9 @@ function bindUiEvents() {
       const body = new URLSearchParams();
       body.set("ssid", ssid);
       body.set("password", password);
+      if (hidden) {
+        body.set("hidden", "1");
+      }
 
       const result = await fetchJson("/api/wifi", {
         method: "POST",

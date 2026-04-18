@@ -5,7 +5,7 @@
   ],
   "idf.port": "/dev/ttyUSB0",
   "idf.monitorPort": "/dev/ttyUSB0",
-  "idf.currentSetup": "/home/phat/Desktop/00.Developer/esp32-idf/.espressif/v6.0/esp-idf",
+  "idf.currentSetup": "/home/phat/Desktop/00.Developer/eim/.espressif/v6.0/esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32",
     "PATH": "/home/phat/.espressif/tools/python/v6.0/venv/bin:/home/phat/.espressif/python_env/idf6.0_py3.10_env/bin:${env:PATH}"
