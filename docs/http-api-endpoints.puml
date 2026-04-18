@@ -1,0 +1,99 @@
+@startuml http_api_endpoints
+!theme plain
+title Air Quality Node – HTTP API & Web Server Endpoints
+
+skinparam class {
+  BackgroundColor #BBDEFB
+}
+
+package "Captive Portal Detection" <<Rectangle>> #FFECB3 {
+  class "GET /generate_204" as C1
+  class "GET /gen_204" as C2
+  class "GET /hotspot-detect.html" as C3
+  class "GET /library/test/success.html" as C4
+  class "GET /ncsi.txt" as C5
+  class "GET /connecttest.txt" as C6
+}
+
+note bottom of "Captive Portal Detection"
+  All redirect to **http://192.168.4.1/**
+  Handles Android, iOS, Windows
+  captive portal detection
+end note
+
+package "Static Web Assets" <<Rectangle>> #E8F5E9 {
+  class "GET /" as W1 {
+    index.html (embedded binary)
+  }
+  class "GET /app.css*" as W2 {
+    app.css (embedded binary)
+  }
+  class "GET /app.js*" as W3 {
+    app.js (embedded binary)
+  }
+}
+
+package "Device State API" <<Rectangle>> #E1BEE7 {
+  class "GET /api/state" as S1 {
+    JSON: wifi_connected, time_synced,
+    provisioning_active, ssid, ip
+  }
+  class "GET /api/telemetry" as S2 {
+    JSON: aqi, pm25, temperature,
+    humidity, sensor readings
+  }
+}
+
+package "WiFi Management API" <<Rectangle>> #BBDEFB {
+  class "GET /api/scan" as WF1 {
+    JSON: [{ssid, rssi, auth}]
+    Triggers WiFi AP scan
+  }
+  class "GET /api/wifi" as WF2 {
+    JSON: {ssid, connected, ip}
+    Current WiFi status
+  }
+  class "POST /wifi" as WF3 {
+    Body: ssid=...&password=...
+    → wifi_test_credentials()
+    → Save to NVS on success
+  }
+  class "POST /api/wifi/disconnect" as WF4 {
+    Disconnect current STA
+    (auto-reconnects via event)
+  }
+  class "POST /api/wifi/forget" as WF5 {
+    Erase NVS credentials
+    → Delayed restart (2s)
+    ⚠ Requires confirm dialog
+  }
+}
+
+package "Provisioning API" <<Rectangle>> #FFCDD2 {
+  class "POST /api/provisioning/start" as P1 {
+    Start AP portal manually
+    (when already in STA mode)
+  }
+  class "POST /api/provisioning/stop" as P2 {
+    Stop AP portal
+    → Switch to STA only
+    (requires valid credentials)
+  }
+}
+
+package "Memory Photo API" <<Rectangle>> #FFF9C4 {
+  class "GET /api/memory" as MP1 {
+    JSON: {has_photo: bool}
+  }
+  class "POST /api/memory/photo" as MP2 {
+    Upload RGB565 photo
+    (40960 bytes = 160×128×2)
+    → Store in NVS
+  }
+  class "DELETE /api/memory/photo" as MP3 {
+    Clear stored photo
+    → Erase from NVS
+  }
+}
+
+@enduml

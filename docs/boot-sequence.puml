@@ -1,0 +1,97 @@
+@startuml boot_sequence
+!theme plain
+title Air Quality Node – Boot Sequence (7-Phase State Machine)
+
+skinparam sequence {
+  ArrowColor #333333
+  LifeLineBorderColor #333333
+  ParticipantBackgroundColor #E1BEE7
+}
+
+participant "main.c" as MAIN
+participant "app_core" as CORE
+participant "display_hal" as DHAL
+participant "app_state_machine" as ASM
+participant "connectivity_service" as CONN
+participant "ui_renderer" as UIR
+participant "dashboard_state" as DASH
+participant "ui_flow" as UIF
+
+== Initialization ==
+
+MAIN -> CORE : app_core_run()
+activate CORE
+CORE -> DHAL : lcd_init()
+note right : SPI2 @26MHz\n160×128 RGB565
+
+== Phase 0: POWER_STABLE (5%) ==
+
+CORE -> ASM : app_state_machine_tick()
+activate ASM
+ASM -> UIR : render_boot_screen(\n  "POWER STABLE", 5%)
+ASM --> ASM : vTaskDelay(300ms)
+
+== Phase 1: DISPLAY_READY (18%) ==
+
+ASM -> UIR : render_boot_screen(\n  "DISPLAY READY", 18%)
+ASM --> ASM : vTaskDelay(300ms)
+
+== Phase 2: NETWORK_STACK (35%) ==
+
+ASM -> UIR : render_boot_screen(\n  "NETWORK STACK", 35%)
+ASM --> ASM : vTaskDelay(300ms)
+
+== Phase 3: WIFI_AND_TIME_SYNC (52%) ==
+
+ASM -> CONN : connectivity_service_setup_and_clock()
+activate CONN
+
+CONN -> CONN : esp_netif_init()\nesp_event_loop_create()
+CONN -> CONN : Create EventGroup\n(CONNECTED | FAIL | SYNC_DONE | SYNC_OK)
+CONN -> CONN : Create clock_sync_task\n+ clock_sync_timer
+
+alt Credentials in NVS
+  CONN -> CONN : esp_wifi_start()\n→ STA mode
+  CONN -> CONN : esp_wifi_connect()
+else No credentials
+  CONN -> CONN : start_provisioning_portal()\n→ AP mode
+end
+
+CONN --> ASM : return
+deactivate CONN
+
+ASM -> UIR : render_boot_screen(\n  "WIFI + NTP SYNC", 52%)
+ASM --> ASM : vTaskDelay(400ms)
+
+== Phase 4: CLOCK_STATUS ==
+
+alt Time synced (NTP OK)
+  ASM -> UIR : render_boot_screen(\n  "CLOCK LOCKED", 88%)
+else Not synced
+  ASM -> UIR : render_boot_screen(\n  "OFFLINE MODE", 76%)
+end
+ASM --> ASM : vTaskDelay(600ms)
+
+== Phase 5: DASHBOARD_READY (100%) ==
+
+ASM -> UIR : render_boot_screen(\n  "DASHBOARD READY", 100%)
+ASM --> ASM : vTaskDelay(500ms)
+
+== Phase 6: RUNNING ==
+
+loop Every 20ms (50 Hz)
+  CORE -> ASM : app_state_machine_tick()
+  
+  alt Every 1000ms
+    ASM -> DASH : dashboard_state_refresh_sensors()
+  end
+  
+  ASM -> UIF  : ui_flow_tick()
+  ASM -> UIR  : render dashboard / menu
+  ASM -> DHAL : fb_push() → SPI DMA
+end
+
+deactivate ASM
+deactivate CORE
+
+@enduml

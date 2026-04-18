@@ -1,0 +1,109 @@
+@startuml freertos_concurrency
+!theme plain
+title Air Quality Node – FreeRTOS Concurrency Model
+
+skinparam rectangle {
+  BackgroundColor<<task>> #E1BEE7
+  BackgroundColor<<primitive>> #BBDEFB
+  BackgroundColor<<isr>> #FFCDD2
+}
+
+rectangle "**Main Task** (app_core)" <<task>> as MAIN_TASK {
+  note right
+    Priority: default (1)
+    Stack: default
+    Loop: 20ms (50 Hz)
+    Runs: state machine,
+    UI, display
+  end note
+}
+
+rectangle "**clock_sync_task**" <<task>> as CLOCK_TASK {
+  note right
+    Priority: default (1)
+    Blocks on: EventGroup
+    CLOCK_SYNC_DONE_BIT
+    On wake: sntp_setservername()
+    → sntp_init()
+    → Wait IP/timeout
+    → Set time_synced
+    Retry: 60s timer
+    Success: 6h timer
+  end note
+}
+
+rectangle "**captive_dns_task**" <<task>> as DNS_TASK {
+  note right
+    Priority: default (1)
+    UDP socket :53
+    Blocks on: recvfrom()
+    Responds: all A records
+    → 192.168.4.1
+  end note
+}
+
+rectangle "**HTTP Server**\n(httpd task)" <<task>> as HTTP_TASK {
+  note right
+    Managed by esp_http_server
+    21 URI handlers
+    max_uri_handlers = 28
+    Port: 80
+  end note
+}
+
+rectangle "**delayed_restart_task**" <<task>> as RESTART_TASK {
+  note right
+    Created on demand
+    vTaskDelay(2000ms)
+    → esp_restart()
+  end note
+}
+
+' ── Synchronization primitives ──
+
+rectangle "EventGroupHandle_t\n**s_wifi_event_group**" <<primitive>> as EG {
+  card "BIT0: WIFI_CONNECTED" as B0
+  card "BIT1: WIFI_FAIL" as B1
+  card "BIT2: CLOCK_SYNC_DONE" as B2
+  card "BIT3: CLOCK_SYNC_OK" as B3
+}
+
+rectangle "TimerHandle_t\n**s_clock_sync_timer**" <<primitive>> as TIMER {
+  note right
+    Retry: 60s (CLOCK_SYNC_RETRY_INTERVAL_MS)
+    Success: 6h (CLOCK_SYNC_INTERVAL_MS)
+    Callback: sets CLOCK_SYNC_DONE_BIT
+  end note
+}
+
+rectangle "portMUX_TYPE\n**Spinlocks (3)**" <<primitive>> as SPIN {
+  card "connectivity_service\n→ s_ui_status" as SP1
+  card "dashboard_state\n→ sensor snapshot" as SP2
+  card "ui_flow\n→ animation state" as SP3
+}
+
+rectangle "SemaphoreHandle_t\n**Mutex (1)**" <<primitive>> as MUTEX {
+  card "memory_photo_service\n→ NVS cache" as MX1
+}
+
+' ── Connections ──
+
+MAIN_TASK --> SP2 : Read sensor snapshot\n(taskENTER_CRITICAL)
+MAIN_TASK --> SP3 : Read/write UI state\n(taskENTER_CRITICAL)
+MAIN_TASK --> MUTEX : Read photo cache
+
+CLOCK_TASK --> EG : Wait CLOCK_SYNC_DONE_BIT\nSet CLOCK_SYNC_OK_BIT
+CLOCK_TASK --> SP1 : Update ui_status
+
+TIMER --> EG : Set CLOCK_SYNC_DONE_BIT\n(from timer callback)
+
+HTTP_TASK --> SP1 : Read ui_status\nfor /api/state
+HTTP_TASK --> SP2 : Read sensor data\nfor /api/telemetry
+HTTP_TASK --> MUTEX : Read/write photo\nfor /api/memory/photo
+HTTP_TASK --> EG : Wait CONNECTED/FAIL\nin wifi_test_credentials()
+
+rectangle "WiFi Event Handler\n(system task context)" <<isr>> as WIFI_EVT
+WIFI_EVT --> EG : Set/Clear\nCONNECTED/FAIL bits
+WIFI_EVT --> SP1 : Update connection state
+
+@enduml

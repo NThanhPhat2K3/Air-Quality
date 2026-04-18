@@ -1,0 +1,74 @@
+@startuml runtime_loop
+!theme plain
+title Air Quality Node – Runtime Main Loop (20ms / 50 Hz)
+
+skinparam activity {
+  BackgroundColor #E1BEE7
+  DiamondBackgroundColor #FFF9C4
+}
+
+start
+
+:app_core_run();
+:lcd_init() → SPI2 @26MHz;
+:app_state_machine_tick()
+ → Execute 6 boot phases
+ → Phase transitions to **RUNNING**;
+
+partition "Main Loop (every 20ms)" {
+
+  repeat
+
+    :app_state_machine_tick();
+
+    if (1000ms elapsed?) then (yes)
+      :dashboard_state_refresh_sensors()
+       → Read AQI, PM2.5, Temperature, Humidity;
+      :dashboard_state_store()
+       → portMUX spinlock write;
+    endif
+
+    :dashboard_state_read()
+     → portMUX spinlock read
+     → Copy snapshot to local;
+
+    :ui_flow_tick();
+
+    partition "UI Flow Logic" {
+      :Update highlight animation
+       → Q8 fixed-point physics
+       → acceleration, velocity, damping;
+
+      if (AQI >= 5?) then (yes)
+        :Start autoplay demo
+         → Cycle 9 menu phases
+         → 1400ms/phase, 5000ms/screen;
+      else (no)
+        :Stop autoplay
+         → Return to MONITOR;
+      endif
+    }
+
+    partition "Render Active Screen" {
+      if (Menu visible?) then (yes)
+        :ui_renderer_draw_local_menu()
+         → 5 items: Monitor, WiFi,
+           Alarm, Game, Memory;
+        :ui_renderer_draw_local_panel()
+         → Panel for active screen;
+      else (no)
+        :ui_renderer_draw_dashboard()
+         → AQI circle, sensor bars,
+           WiFi icon, time, date;
+      endif
+    }
+
+    :fb_push() → DMA transfer
+     to ST7735 via SPI;
+
+    :vTaskDelay(20ms);
+
+  repeat while (forever)
+}
+
+@enduml

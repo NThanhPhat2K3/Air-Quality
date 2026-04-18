@@ -1,0 +1,79 @@
+@startuml system_component_diagram
+!theme plain
+title Air Quality Node – System Component Diagram
+
+skinparam component {
+  BackgroundColor<<hardware>> #FFE0B2
+  BackgroundColor<<service>> #BBDEFB
+  BackgroundColor<<ui>> #C8E6C9
+  BackgroundColor<<app>> #E1BEE7
+  BackgroundColor<<driver>> #FFF9C4
+}
+
+package "Application Layer" <<Rectangle>> {
+  [main.c] <<app>> as MAIN
+  [app_core] <<app>> as CORE
+  [app_state_machine] <<app>> as ASM
+}
+
+package "UI Layer" <<Rectangle>> {
+  [ui_flow] <<ui>> as UIF
+  [ui_renderer] <<ui>> as UIR
+}
+
+package "Service Layer" <<Rectangle>> {
+  [connectivity_service] <<service>> as CONN
+  [captive_dns] <<service>> as DNS
+  [memory_photo_service] <<service>> as MEM
+  [dashboard_state] <<service>> as DASH
+}
+
+package "Driver Layer" <<Rectangle>> {
+  [display_hal] <<driver>> as DHAL
+}
+
+package "Hardware" <<Rectangle>> {
+  [ST7735 TFT\n160×128 SPI] <<hardware>> as TFT
+  [ESP32 WiFi\n802.11 b/g/n] <<hardware>> as WIFI_HW
+  [NVS Flash] <<hardware>> as NVS
+}
+
+' ── Application flow ──
+MAIN --> CORE : app_core_run()
+CORE --> DHAL : lcd_init()
+CORE --> ASM  : app_state_machine_tick()
+
+' ── State machine dependencies ──
+ASM --> UIR  : render boot screens
+ASM --> CONN : setup_and_clock()\nis_time_synced()\nis_wifi_connected()
+ASM --> DASH : dashboard_state_refresh_sensors()\ndashboard_state_read()
+ASM --> UIF  : ui_flow_tick()\nui_flow_dispatch()
+
+' ── UI dependencies ──
+UIF --> UIR  : ui_renderer_draw_local_panel()\nui_renderer_draw_dashboard()
+UIF --> CONN : get_ui_status()
+UIF --> DASH : dashboard_state_read()
+UIF --> MEM  : memory_photo_*()
+UIR --> DHAL : fb_fill(), fb_blit(),\nfb_text(), fb_push()
+
+' ── Service dependencies ──
+CONN --> DNS  : captive_dns_start/stop()
+CONN --> MEM  : memory_photo_*() [HTTP handlers]
+CONN --> DASH : dashboard_state_read() [telemetry API]
+
+' ── Hardware connections ──
+DHAL --> TFT   : SPI2 @26MHz\nMOSI=23 CLK=18 CS=5\nDC=2 RST=4
+CONN --> WIFI_HW : esp_wifi_*()
+CONN --> NVS   : nvs_get/set()\n"wifi_cfg" namespace
+MEM  --> NVS   : nvs_get/set()\n"memory_photo" namespace
+
+legend right
+  |= Color |= Layer |
+  | <#E1BEE7> | Application |
+  | <#C8E6C9> | UI |
+  | <#BBDEFB> | Service |
+  | <#FFF9C4> | Driver |
+  | <#FFE0B2> | Hardware |
+endlegend
+
+@enduml

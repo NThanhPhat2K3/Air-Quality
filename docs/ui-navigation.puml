@@ -1,0 +1,73 @@
+@startuml ui_navigation
+!theme plain
+title Air Quality Node – UI Flow & Menu Navigation
+
+skinparam state {
+  BackgroundColor<<menu>> #C8E6C9
+  BackgroundColor<<screen>> #BBDEFB
+  BackgroundColor<<dashboard>> #E1BEE7
+}
+
+state "Dashboard View" as DASH <<dashboard>> {
+  state "AQI Circle + Sensor Bars\n+ WiFi Icon + Time + Date" as DASH_VIEW
+}
+
+state "Local Menu (5 items)" as MENU <<menu>> {
+  state "Monitor" as M0 <<menu>>
+  state "WiFi" as M1 <<menu>>
+  state "Alarm" as M2 <<menu>>
+  state "Game" as M3 <<menu>>
+  state "Memory" as M4 <<menu>>
+
+  M0 -[hidden]down-> M1
+  M1 -[hidden]down-> M2
+  M2 -[hidden]down-> M3
+  M3 -[hidden]down-> M4
+}
+
+state "WiFi Panel" as SWIFI <<screen>> : SSID, IP, Status\nProvisioning info
+
+state "Memory Panel" as SMEM <<screen>> : Photo display\nRGB565 160×128
+
+state "Alarm Panel" as SALARM <<screen>> : Alarm settings
+
+state "Game Panel" as SGAME <<screen>> : Mini game
+
+[*] --> DASH : Boot complete\n(RUNNING phase)
+
+' ── Dashboard ↔ Menu ──
+DASH --> MENU : UI_FLOW_EVENT_SET_SCREEN\n(menu activated)
+MENU --> DASH : Select "Monitor"\nor autoplay ends
+
+' ── Menu → Screen panels ──
+M1 --> SWIFI : Select "WiFi"\n→ MENU_SMOKE_PHASE_SCREEN_WIFI
+M4 --> SMEM  : Select "Memory"\n→ MENU_SMOKE_PHASE_SCREEN_MEMORY
+
+' ── Return from screens ──
+SWIFI --> M1 : Return\n→ MENU_SMOKE_PHASE_MENU_RETURN_WIFI
+SMEM  --> M0 : Return\n→ MENU_SMOKE_PHASE_RETURN_MONITOR
+
+' ── External events ──
+DASH --> SMEM : UI_FLOW_EVENT_MEMORY_PHOTO_UPDATED\n(photo uploaded via HTTP)
+SMEM --> DASH : UI_FLOW_EVENT_MEMORY_PHOTO_CLEARED\n(photo deleted via HTTP)
+
+note bottom of MENU
+  **Autoplay Demo (AQI ≥ 5)**
+  Cycle: Monitor → WiFi → WiFi Screen (5s)
+  → WiFi → Alarm → Game → Memory
+  → Memory Screen (5s) → Monitor
+  Each menu item: 1400ms
+  Return: 1800ms
+end note
+
+note right of MENU
+  **Highlight Animation**
+  Q8 fixed-point physics
+  Y targets: [36, 54, 72, 90, 108]
+  Spacing: 18px per item
+  Accel: diff/3 (clamped ±1)
+  Velocity damping: ×27/32
+  Velocity clamp: ±520
+end note
+
+@enduml

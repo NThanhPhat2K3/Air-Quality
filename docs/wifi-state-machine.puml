@@ -1,0 +1,90 @@
+@startuml wifi_state_machine
+!theme plain
+title Air Quality Node – WiFi & Provisioning State Machine
+
+skinparam state {
+  BackgroundColor<<connected>> #C8E6C9
+  BackgroundColor<<disconnected>> #FFCDD2
+  BackgroundColor<<provisioning>> #BBDEFB
+  BackgroundColor<<testing>> #FFF9C4
+}
+
+state "WiFi OFF\n(Driver Not Started)" as OFF <<disconnected>>
+
+state "STA Mode" as STA {
+  state "Connecting..." as STA_CONN <<disconnected>>
+  state "Connected\n(Got IP)" as STA_OK <<connected>>
+  state "Retry Loop\n(max retries)" as STA_RETRY <<disconnected>>
+  state "Failed\n(retries exhausted)" as STA_FAIL <<disconnected>>
+}
+
+state "AP+STA Mode\n(Provisioning Portal)" as PORTAL <<provisioning>> {
+  state "Portal Active\nSSID: aqnode-[MAC]\nPass: setup123" as PORTAL_ACTIVE
+  state "Captive DNS\nUDP :53 → 192.168.4.1" as CDNS
+  state "HTTP Server\n:80 (21 handlers)" as HTTP
+
+  PORTAL_ACTIVE --> CDNS
+  PORTAL_ACTIVE --> HTTP
+}
+
+state "Testing Credentials" as TEST <<testing>> {
+  state "Pre-scan\n(search SSID)" as PRESCAN
+  state "Disconnect STA\n(keep AP alive)" as TEST_DISC
+  state "Connect test\n(max 3 retries, 15s)" as TEST_CONN
+  state "Restore previous\nSTA config" as TEST_RESTORE
+}
+
+' ── Boot transitions ──
+[*] --> OFF : ESP32 power-on
+
+OFF --> STA_CONN : Credentials\nfound in NVS
+OFF --> PORTAL_ACTIVE : No credentials\nin NVS
+
+' ── STA transitions ──
+STA_CONN --> STA_OK : IP_EVENT_STA_GOT_IP\n→ Set CONNECTED_BIT\n→ Reset retry = 0
+STA_CONN --> STA_RETRY : WIFI_EVENT_STA_DISCONNECTED
+
+STA_RETRY --> STA_CONN : retry < MAX\n→ esp_wifi_connect()
+STA_RETRY --> STA_FAIL : retry >= MAX\n→ Set FAIL_BIT
+
+STA_OK --> STA_RETRY : WIFI_EVENT_STA_DISCONNECTED\n(connection lost)
+
+' ── Portal transitions ──
+STA_FAIL --> PORTAL_ACTIVE : Auto-open portal\n(s_provisioning_auto_opened)
+STA_OK --> PORTAL_ACTIVE : User POST\n/api/provisioning/start
+
+PORTAL_ACTIVE --> STA_CONN : User POST /api/provisioning/stop\n(has credentials, not connected)
+PORTAL_ACTIVE --> STA_OK : User POST /api/provisioning/stop\n(already connected → STA only)
+
+' ── Test-before-save flow ──
+PORTAL_ACTIVE --> PRESCAN : User POST /wifi\n(new SSID + password)
+
+PRESCAN --> TEST_DISC : SSID found\nin scan results
+PRESCAN --> PORTAL_ACTIVE : SSID not found\n→ WIFI_TEST_RESULT_NOT_FOUND
+
+TEST_DISC --> TEST_CONN : Apply test config\n→ esp_wifi_connect()
+
+TEST_CONN --> STA_OK : Test SUCCESS\n→ Save to NVS\n→ WIFI_TEST_RESULT_CONNECTED
+TEST_CONN --> TEST_RESTORE : Test FAILED\n(wrong password / timeout)
+
+TEST_RESTORE --> PORTAL_ACTIVE : Restore AP+STA\n→ Return error to user
+TEST_RESTORE --> STA_CONN : Not in portal mode\n→ Restore original STA
+
+' ── Management actions ──
+STA_OK --> STA_CONN : POST /api/wifi/disconnect\n→ Reconnects immediately \nvia event handler
+
+STA_OK -[#red]-> OFF : POST /api/wifi/forget\n→ Erase NVS\n→ Delayed restart (2s)
+PORTAL_ACTIVE -[#red]-> OFF : POST /api/wifi/forget\n→ Erase NVS\n→ Delayed restart (2s)
+
+' ── Auto-reconnect probe ──
+note right of STA_FAIL
+  **Auto-reconnect probe:**
+  When portal was auto-opened
+  (s_provisioning_auto_opened),
+  clock_sync_task periodically
+  probes original STA credentials
+  while in AP+STA mode.
+  On success → switch to STA only.
+end note
+
+@enduml
