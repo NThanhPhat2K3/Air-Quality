@@ -22,6 +22,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "mdns.h"
@@ -68,6 +69,8 @@
 #define DEMO_AQI_STEP_SECONDS 6
 #define MENU_SMOKE_AUTOPLAY 1
 #define MENU_SMOKE_STEP_MS 1400
+#define MENU_SMOKE_WIFI_HOLD_MS 5000
+#define MENU_SMOKE_MONITOR_RETURN_MS 1800
 #define DASHBOARD_SENSOR_REFRESH_MS 1000
 #define DISPLAY_FRAME_INTERVAL_MS 20
 
@@ -93,6 +96,8 @@
 #define WIFI_CREDENTIALS_KEY_SSID "ssid"
 #define WIFI_CREDENTIALS_KEY_PASS "pass"
 #define WIFI_CREDENTIALS_KEY_HIDDEN "hidden"
+#define MEMORY_PHOTO_NAMESPACE "memory_photo"
+#define MEMORY_PHOTO_KEY_DATA "data"
 #define WIFI_PROVISIONING_AP_PASS "setup123"
 #define WIFI_PROVISIONING_MAX_CONN 4
 #define WIFI_PROVISIONING_BODY_MAX_LEN 256
@@ -103,6 +108,8 @@
 #define WIFI_STATE_JSON_MAX_LEN 1024
 #define WIFI_CONNECT_FAIL_PORTAL_THRESHOLD 3
 #define WIFI_TARGET_MISSING_PORTAL_THRESHOLD 2
+#define MEMORY_PHOTO_PIXEL_BYTES (TFT_WIDTH * TFT_HEIGHT * 2)
+#define MEMORY_PHOTO_JSON_MAX_LEN 256
 #define RUNTIME_MDNS_HOSTNAME "aqnode"
 #define RUNTIME_MDNS_INSTANCE "AQ Node"
 
@@ -177,6 +184,19 @@ typedef struct {
   uint8_t pulse_phase;
 } local_menu_state_t;
 
+typedef enum {
+  MENU_SMOKE_PHASE_MENU_MONITOR = 0,
+  MENU_SMOKE_PHASE_MENU_WIFI,
+  MENU_SMOKE_PHASE_SCREEN_WIFI,
+  MENU_SMOKE_PHASE_MENU_RETURN_WIFI,
+  MENU_SMOKE_PHASE_MENU_ALARM,
+  MENU_SMOKE_PHASE_MENU_GAME,
+  MENU_SMOKE_PHASE_MENU_MEMORY,
+  MENU_SMOKE_PHASE_SCREEN_MEMORY,
+  MENU_SMOKE_PHASE_RETURN_MONITOR,
+  MENU_SMOKE_PHASE_COUNT,
+} menu_smoke_phase_t;
+
 static const char *TAG = "st7735_dashboard";
 
 static spi_device_handle_t s_lcd_spi;
@@ -200,6 +220,10 @@ static int s_wifi_connect_fail_cycles;
 static int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
 static char s_provisioning_ap_ssid[33];
+static SemaphoreHandle_t s_memory_photo_mutex;
+static uint16_t s_memory_photo[TFT_WIDTH * TFT_HEIGHT];
+static bool s_memory_photo_loaded;
+static bool s_memory_photo_cache_checked;
 static dashboard_state_t s_latest_dashboard_state;
 static bool s_latest_dashboard_state_valid;
 static portMUX_TYPE s_dashboard_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -214,6 +238,7 @@ static local_menu_state_t s_local_menu = {
 static portMUX_TYPE s_local_menu_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_menu_smoke_demo_started;
 static int64_t s_menu_smoke_demo_started_us;
+static menu_smoke_phase_t s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
 
 extern const uint8_t web_index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t web_index_html_end[] asm("_binary_index_html_end");
@@ -228,6 +253,13 @@ static bool start_provisioning_portal(void);
 static void fill_sta_wifi_config(wifi_config_t *wifi_config);
 static void ensure_mdns_service(void);
 static wifi_target_scan_result_t wifi_scan_for_target_ssid(void);
+static bool ensure_memory_photo_mutex(void);
+static void memory_photo_clear_cache(void);
+static bool memory_photo_restore_from_nvs(void);
+static bool memory_photo_save_blob(const uint8_t *data, size_t data_len);
+static bool memory_photo_delete_blob(void);
+static bool memory_photo_snapshot(uint16_t *dest, size_t pixel_count);
+static void local_menu_set_active_screen(local_screen_t screen, bool show_menu);
 static void snapshot_dashboard_state(const dashboard_state_t *state);
 static bool read_dashboard_state_snapshot(dashboard_state_t *out);
 static void build_runtime_dashboard_state(dashboard_state_t *state);
@@ -556,6 +588,203 @@ static void wifi_refresh_credentials_cache(void) {
   s_wifi_credentials_loaded = true;
 }
 
+static bool ensure_memory_photo_mutex(void) {
+  if (s_memory_photo_mutex != NULL) {
+    return true;
+  }
+
+  s_memory_photo_mutex = xSemaphoreCreateMutex();
+  if (s_memory_photo_mutex == NULL) {
+    ESP_LOGE(TAG, "Cannot create memory photo mutex");
+    return false;
+  }
+  return true;
+}
+
+static void memory_photo_clear_cache(void) {
+  if (!ensure_memory_photo_mutex()) {
+    return;
+  }
+
+  if (xSemaphoreTake(s_memory_photo_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    ESP_LOGW(TAG, "Memory photo cache lock timeout during clear");
+    return;
+  }
+  memset(s_memory_photo, 0, sizeof(s_memory_photo));
+  s_memory_photo_loaded = false;
+  xSemaphoreGive(s_memory_photo_mutex);
+}
+
+static bool memory_photo_restore_from_nvs(void) {
+  if (s_memory_photo_cache_checked) {
+    return s_memory_photo_loaded;
+  }
+  if (!ensure_memory_photo_mutex()) {
+    return false;
+  }
+
+  nvs_handle_t nvs_handle;
+  esp_err_t ret = nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    s_memory_photo_cache_checked = true;
+    memory_photo_clear_cache();
+    return false;
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Open memory photo namespace failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  size_t blob_size = 0;
+  ret = nvs_get_blob(nvs_handle, MEMORY_PHOTO_KEY_DATA, NULL, &blob_size);
+  if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    nvs_close(nvs_handle);
+    s_memory_photo_cache_checked = true;
+    memory_photo_clear_cache();
+    return false;
+  }
+  if (ret != ESP_OK || blob_size != MEMORY_PHOTO_PIXEL_BYTES) {
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "Read memory photo size failed: %s", esp_err_to_name(ret));
+    } else {
+      ESP_LOGW(TAG, "Memory photo blob has unexpected size: %u",
+               (unsigned)blob_size);
+    }
+    nvs_close(nvs_handle);
+    s_memory_photo_cache_checked = true;
+    memory_photo_clear_cache();
+    return false;
+  }
+
+  uint8_t *temp = malloc(blob_size);
+  if (temp == NULL) {
+    nvs_close(nvs_handle);
+    ESP_LOGW(TAG, "Allocate temp memory photo buffer failed");
+    return false;
+  }
+
+  ret = nvs_get_blob(nvs_handle, MEMORY_PHOTO_KEY_DATA, temp, &blob_size);
+  nvs_close(nvs_handle);
+  if (ret != ESP_OK) {
+    free(temp);
+    ESP_LOGW(TAG, "Read memory photo blob failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  if (xSemaphoreTake(s_memory_photo_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+    free(temp);
+    ESP_LOGW(TAG, "Memory photo cache lock timeout during restore");
+    return false;
+  }
+  memcpy(s_memory_photo, temp, MEMORY_PHOTO_PIXEL_BYTES);
+  s_memory_photo_loaded = true;
+  s_memory_photo_cache_checked = true;
+  xSemaphoreGive(s_memory_photo_mutex);
+  free(temp);
+  ESP_LOGI(TAG, "Memory photo restored from NVS");
+  return true;
+}
+
+static bool memory_photo_save_blob(const uint8_t *data, size_t data_len) {
+  if (data == NULL || data_len != MEMORY_PHOTO_PIXEL_BYTES) {
+    return false;
+  }
+  if (!ensure_memory_photo_mutex()) {
+    return false;
+  }
+
+  nvs_handle_t nvs_handle;
+  esp_err_t ret =
+      nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Open memory photo namespace for write failed: %s",
+             esp_err_to_name(ret));
+    return false;
+  }
+
+  ret = nvs_set_blob(nvs_handle, MEMORY_PHOTO_KEY_DATA, data, data_len);
+  if (ret == ESP_OK) {
+    ret = nvs_commit(nvs_handle);
+  }
+  nvs_close(nvs_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Save memory photo blob failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  if (xSemaphoreTake(s_memory_photo_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+    ESP_LOGW(TAG, "Memory photo cache lock timeout during save");
+    s_memory_photo_cache_checked = false;
+    s_memory_photo_loaded = false;
+    return true;
+  }
+  memcpy(s_memory_photo, data, data_len);
+  s_memory_photo_loaded = true;
+  s_memory_photo_cache_checked = true;
+  xSemaphoreGive(s_memory_photo_mutex);
+  return true;
+}
+
+static bool memory_photo_delete_blob(void) {
+  if (!ensure_memory_photo_mutex()) {
+    return false;
+  }
+
+  nvs_handle_t nvs_handle;
+  esp_err_t ret =
+      nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    s_memory_photo_cache_checked = true;
+    memory_photo_clear_cache();
+    return true;
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Open memory photo namespace for erase failed: %s",
+             esp_err_to_name(ret));
+    return false;
+  }
+
+  ret = nvs_erase_key(nvs_handle, MEMORY_PHOTO_KEY_DATA);
+  if (ret == ESP_ERR_NVS_NOT_FOUND) {
+    ret = ESP_OK;
+  }
+  if (ret == ESP_OK) {
+    ret = nvs_commit(nvs_handle);
+  }
+  nvs_close(nvs_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Erase memory photo blob failed: %s", esp_err_to_name(ret));
+    return false;
+  }
+
+  s_memory_photo_cache_checked = false;
+  s_memory_photo_loaded = false;
+  memory_photo_clear_cache();
+  return true;
+}
+
+static bool memory_photo_snapshot(uint16_t *dest, size_t pixel_count) {
+  if (dest == NULL || pixel_count < (size_t)(TFT_WIDTH * TFT_HEIGHT)) {
+    return false;
+  }
+  if (!ensure_memory_photo_mutex()) {
+    return false;
+  }
+  if (!s_memory_photo_cache_checked) {
+    memory_photo_restore_from_nvs();
+  }
+  if (!s_memory_photo_loaded) {
+    return false;
+  }
+  if (xSemaphoreTake(s_memory_photo_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    ESP_LOGW(TAG, "Memory photo cache lock timeout during snapshot");
+    return false;
+  }
+  memcpy(dest, s_memory_photo, MEMORY_PHOTO_PIXEL_BYTES);
+  xSemaphoreGive(s_memory_photo_mutex);
+  return true;
+}
+
 static bool wifi_credentials_configured(void) {
   wifi_refresh_credentials_cache();
   return s_wifi_credentials.valid;
@@ -656,6 +885,20 @@ static local_menu_state_t local_menu_snapshot(void) {
   return snapshot;
 }
 
+static void local_menu_set_active_screen(local_screen_t screen, bool show_menu) {
+  int index = clamp_int((int)screen, 0, LOCAL_SCREEN_COUNT - 1);
+
+  portENTER_CRITICAL(&s_local_menu_lock);
+  s_local_menu.active_screen = (local_screen_t)index;
+  s_local_menu.selected_index = index;
+  s_local_menu.visible = show_menu;
+  if (s_local_menu.highlight_y_q8 == 0 || !show_menu) {
+    s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
+    s_local_menu.highlight_velocity_q8 = 0;
+  }
+  portEXIT_CRITICAL(&s_local_menu_lock);
+}
+
 static void local_menu_tick(void) {
   int target_y_q8;
   int diff;
@@ -733,22 +976,14 @@ static void sanitize_display_text(const char *source, char *dest,
 static void local_menu_run_smoke_demo(const dashboard_state_t *state) {
 #if APP_SENSOR_SMOKE_TEST && MENU_SMOKE_AUTOPLAY
   int64_t now_us;
-  int64_t elapsed_ms;
   int index;
+  int phase_duration_ms;
 
   if (state == NULL) {
     return;
   }
 
-  if (state->aqi < 5) {
-    if (s_menu_smoke_demo_started) {
-      portENTER_CRITICAL(&s_local_menu_lock);
-      s_local_menu.visible = false;
-      s_local_menu.selected_index = (int)s_local_menu.active_screen;
-      portEXIT_CRITICAL(&s_local_menu_lock);
-    }
-    s_menu_smoke_demo_started = false;
-    s_menu_smoke_demo_started_us = 0;
+  if (!s_menu_smoke_demo_started && state->aqi < 5) {
     return;
   }
 
@@ -756,16 +991,83 @@ static void local_menu_run_smoke_demo(const dashboard_state_t *state) {
   if (!s_menu_smoke_demo_started) {
     s_menu_smoke_demo_started = true;
     s_menu_smoke_demo_started_us = now_us;
+    s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
   }
 
-  elapsed_ms = (now_us - s_menu_smoke_demo_started_us) / 1000LL;
-  index = (int)((elapsed_ms / MENU_SMOKE_STEP_MS) % LOCAL_SCREEN_COUNT);
+  phase_duration_ms = MENU_SMOKE_STEP_MS;
+  if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_SCREEN_WIFI) {
+    phase_duration_ms = MENU_SMOKE_WIFI_HOLD_MS;
+  } else if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_SCREEN_MEMORY) {
+    phase_duration_ms = MENU_SMOKE_WIFI_HOLD_MS;
+  } else if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_RETURN_MONITOR) {
+    phase_duration_ms = MENU_SMOKE_MONITOR_RETURN_MS;
+  }
+
+  if (((now_us - s_menu_smoke_demo_started_us) / 1000LL) >= phase_duration_ms) {
+    menu_smoke_phase_t next_phase = (menu_smoke_phase_t)(((int)s_menu_smoke_demo_phase + 1) %
+                                                         MENU_SMOKE_PHASE_COUNT);
+    if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_RETURN_MONITOR &&
+        state->aqi < 5) {
+      portENTER_CRITICAL(&s_local_menu_lock);
+      s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
+      s_local_menu.visible = false;
+      s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
+      portEXIT_CRITICAL(&s_local_menu_lock);
+      s_menu_smoke_demo_started = false;
+      s_menu_smoke_demo_started_us = 0;
+      s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
+      return;
+    }
+    s_menu_smoke_demo_phase = next_phase;
+    s_menu_smoke_demo_started_us = now_us;
+  }
 
   portENTER_CRITICAL(&s_local_menu_lock);
+  s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
   s_local_menu.visible = true;
+
+  switch (s_menu_smoke_demo_phase) {
+  case MENU_SMOKE_PHASE_MENU_MONITOR:
+    s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
+    index = LOCAL_SCREEN_MONITOR;
+    break;
+  case MENU_SMOKE_PHASE_MENU_WIFI:
+    index = LOCAL_SCREEN_WIFI;
+    break;
+  case MENU_SMOKE_PHASE_SCREEN_WIFI:
+    index = LOCAL_SCREEN_WIFI;
+    s_local_menu.visible = false;
+    s_local_menu.active_screen = LOCAL_SCREEN_WIFI;
+    break;
+  case MENU_SMOKE_PHASE_MENU_RETURN_WIFI:
+    index = LOCAL_SCREEN_WIFI;
+    break;
+  case MENU_SMOKE_PHASE_MENU_ALARM:
+    index = LOCAL_SCREEN_ALARM;
+    break;
+  case MENU_SMOKE_PHASE_MENU_GAME:
+    index = LOCAL_SCREEN_GAME;
+    break;
+  case MENU_SMOKE_PHASE_MENU_MEMORY:
+    index = LOCAL_SCREEN_MEMORY;
+    break;
+  case MENU_SMOKE_PHASE_SCREEN_MEMORY:
+    index = LOCAL_SCREEN_MEMORY;
+    s_local_menu.visible = false;
+    s_local_menu.active_screen = LOCAL_SCREEN_MEMORY;
+    break;
+  case MENU_SMOKE_PHASE_RETURN_MONITOR:
+  default:
+    index = LOCAL_SCREEN_MONITOR;
+    s_local_menu.visible = false;
+    s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
+    break;
+  }
+
   s_local_menu.selected_index = index;
   if (s_local_menu.highlight_y_q8 == 0) {
     s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
+    s_local_menu.highlight_velocity_q8 = 0;
   }
   portEXIT_CRITICAL(&s_local_menu_lock);
 #else
@@ -1046,6 +1348,33 @@ static bool read_http_body(httpd_req_t *req, char *out, size_t out_len) {
   return true;
 }
 
+static bool read_http_body_bytes(httpd_req_t *req, uint8_t *out,
+                                 size_t expected_len) {
+  size_t received = 0;
+
+  if (req == NULL || out == NULL || expected_len == 0) {
+    return false;
+  }
+  if (req->content_len != (int)expected_len) {
+    ESP_LOGW(TAG, "Unexpected binary upload size: got=%d expected=%u",
+             req->content_len, (unsigned)expected_len);
+    return false;
+  }
+
+  while (received < expected_len) {
+    int remaining = (int)(expected_len - received);
+    int ret = httpd_req_recv(req, (char *)out + received, remaining);
+    if (ret <= 0) {
+      if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+        continue;
+      }
+      return false;
+    }
+    received += (size_t)ret;
+  }
+  return true;
+}
+
 static esp_err_t serve_embedded_file(httpd_req_t *req, const uint8_t *start,
                                      const uint8_t *end,
                                      const char *content_type) {
@@ -1138,6 +1467,63 @@ static esp_err_t config_telemetry_get_handler(httpd_req_t *req) {
            state.aqi, state.eco2_ppm, state.tvoc_ppb, state.ens_validity,
            state.temp_tenths_c / 10.0f, state.humidity_pct);
   return send_json_response(req, "200 OK", payload);
+}
+
+static esp_err_t config_memory_get_handler(httpd_req_t *req) {
+  char payload[MEMORY_PHOTO_JSON_MAX_LEN];
+  bool ready = memory_photo_restore_from_nvs();
+
+  snprintf(payload, sizeof(payload),
+           "{\"ok\":true,\"ready\":%s,\"width\":%d,\"height\":%d,\"bytes\":%d}",
+           ready ? "true" : "false", TFT_WIDTH, TFT_HEIGHT,
+           MEMORY_PHOTO_PIXEL_BYTES);
+  return send_json_response(req, "200 OK", payload);
+}
+
+static esp_err_t config_memory_post_handler(httpd_req_t *req) {
+  char content_type[80] = {0};
+  if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type,
+                                  sizeof(content_type)) == ESP_OK) {
+    if (strncmp(content_type, "application/octet-stream", 24) != 0) {
+      return send_json_message(req, "415 Unsupported Media Type", false,
+                               "Upload must use application/octet-stream");
+    }
+  }
+
+  uint8_t *upload = malloc(MEMORY_PHOTO_PIXEL_BYTES);
+  if (upload == NULL) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Out of memory");
+  }
+
+  bool body_ok = read_http_body_bytes(req, upload, MEMORY_PHOTO_PIXEL_BYTES);
+  if (!body_ok) {
+    free(upload);
+    return send_json_message(req, "400 Bad Request", false,
+                             "Invalid memory photo payload");
+  }
+
+  bool saved = memory_photo_save_blob(upload, MEMORY_PHOTO_PIXEL_BYTES);
+  free(upload);
+  if (!saved) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to save memory photo");
+  }
+
+  local_menu_set_active_screen(LOCAL_SCREEN_MEMORY, false);
+  ESP_LOGI(TAG, "Memory photo updated successfully");
+  return send_json_message(req, "200 OK", true,
+                           "Memory photo updated on device.");
+}
+
+static esp_err_t config_memory_delete_handler(httpd_req_t *req) {
+  if (!memory_photo_delete_blob()) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to clear memory photo");
+  }
+  local_menu_set_active_screen(LOCAL_SCREEN_MONITOR, false);
+  return send_json_message(req, "200 OK", true,
+                           "Memory photo cleared.");
 }
 
 static const char *wifi_auth_mode_to_text(wifi_auth_mode_t auth_mode) {
@@ -1396,7 +1782,7 @@ static bool start_config_http_server(void) {
   }
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 24;
+  config.max_uri_handlers = 28;
   config.stack_size = 6144;
   config.uri_match_fn = httpd_uri_match_wildcard;
 
@@ -1497,6 +1883,24 @@ static bool start_config_http_server(void) {
       .handler = config_provisioning_start_post_handler,
       .user_ctx = NULL,
   };
+  httpd_uri_t memory_status_uri = {
+      .uri = "/api/memory",
+      .method = HTTP_GET,
+      .handler = config_memory_get_handler,
+      .user_ctx = NULL,
+  };
+  httpd_uri_t memory_upload_uri = {
+      .uri = "/api/memory/photo",
+      .method = HTTP_POST,
+      .handler = config_memory_post_handler,
+      .user_ctx = NULL,
+  };
+  httpd_uri_t memory_delete_uri = {
+      .uri = "/api/memory/photo",
+      .method = HTTP_DELETE,
+      .handler = config_memory_delete_handler,
+      .user_ctx = NULL,
+  };
 
   ret = httpd_register_uri_handler(s_config_http_server, &root_uri);
   if (ret == ESP_OK) {
@@ -1547,6 +1951,15 @@ static bool start_config_http_server(void) {
   if (ret == ESP_OK) {
     ret = httpd_register_uri_handler(s_config_http_server,
                                      &provisioning_start_uri);
+  }
+  if (ret == ESP_OK) {
+    ret = httpd_register_uri_handler(s_config_http_server, &memory_status_uri);
+  }
+  if (ret == ESP_OK) {
+    ret = httpd_register_uri_handler(s_config_http_server, &memory_upload_uri);
+  }
+  if (ret == ESP_OK) {
+    ret = httpd_register_uri_handler(s_config_http_server, &memory_delete_uri);
   }
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Register HTTP handlers failed: %s", esp_err_to_name(ret));
@@ -1869,6 +2282,7 @@ static bool wifi_service_init_once(void) {
 
   ensure_mdns_service();
   wifi_refresh_credentials_cache();
+  memory_photo_restore_from_nvs();
   return true;
 }
 
@@ -2959,8 +3373,20 @@ static void draw_game_screen(void) {
 }
 
 static void draw_memory_screen(void) {
-  fb_clear(COLOR_BG);
-  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+  if (memory_photo_snapshot(s_framebuffer, TFT_WIDTH * TFT_HEIGHT)) {
+    return;
+  }
+
+  draw_local_header("MEMORY VIEW", "UPLOAD PHOTO");
+  draw_panel(8, 35, 144, 40, COLOR_CYAN);
+  fb_draw_text5x7(16, 44, "NO MEMORY PHOTO", COLOR_WHITE, 1);
+  fb_draw_text5x7(16, 56, "OPEN WEB TAB TO", COLOR_MUTED, 1);
+  fb_draw_text5x7(16, 66, "LOAD RGB565 IMAGE", COLOR_CYAN, 1);
+
+  draw_panel(8, 82, 144, 38, COLOR_LIME);
+  fb_draw_text5x7(16, 91, "TIP", COLOR_MUTED, 1);
+  fb_draw_text5x7(16, 103, "WEB WILL SCALE IT", COLOR_WHITE, 1);
+  fb_draw_text5x7(16, 113, "TO 160X128 FOR YOU", COLOR_LIME, 1);
 }
 
 static void draw_menu_overlay(const local_menu_state_t *menu) {
