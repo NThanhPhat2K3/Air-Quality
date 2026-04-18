@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "captive_dns.h"
+#include "ui_flow.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
@@ -67,10 +68,6 @@
 // 1 = cycle stub AQI values through all thresholds so the UI can be reviewed.
 #define DEMO_AQI_SWEEP 1
 #define DEMO_AQI_STEP_SECONDS 6
-#define MENU_SMOKE_AUTOPLAY 1
-#define MENU_SMOKE_STEP_MS 1400
-#define MENU_SMOKE_WIFI_HOLD_MS 5000
-#define MENU_SMOKE_MONITOR_RETURN_MS 1800
 #define DASHBOARD_SENSOR_REFRESH_MS 1000
 #define DISPLAY_FRAME_INTERVAL_MS 20
 
@@ -166,37 +163,6 @@ typedef struct {
   uint16_t delay_ms;
 } lcd_init_cmd_t;
 
-typedef enum {
-  LOCAL_SCREEN_MONITOR = 0,
-  LOCAL_SCREEN_WIFI,
-  LOCAL_SCREEN_ALARM,
-  LOCAL_SCREEN_GAME,
-  LOCAL_SCREEN_MEMORY,
-  LOCAL_SCREEN_COUNT,
-} local_screen_t;
-
-typedef struct {
-  bool visible;
-  local_screen_t active_screen;
-  int selected_index;
-  int highlight_y_q8;
-  int highlight_velocity_q8;
-  uint8_t pulse_phase;
-} local_menu_state_t;
-
-typedef enum {
-  MENU_SMOKE_PHASE_MENU_MONITOR = 0,
-  MENU_SMOKE_PHASE_MENU_WIFI,
-  MENU_SMOKE_PHASE_SCREEN_WIFI,
-  MENU_SMOKE_PHASE_MENU_RETURN_WIFI,
-  MENU_SMOKE_PHASE_MENU_ALARM,
-  MENU_SMOKE_PHASE_MENU_GAME,
-  MENU_SMOKE_PHASE_MENU_MEMORY,
-  MENU_SMOKE_PHASE_SCREEN_MEMORY,
-  MENU_SMOKE_PHASE_RETURN_MONITOR,
-  MENU_SMOKE_PHASE_COUNT,
-} menu_smoke_phase_t;
-
 static const char *TAG = "st7735_dashboard";
 
 static spi_device_handle_t s_lcd_spi;
@@ -227,18 +193,6 @@ static bool s_memory_photo_cache_checked;
 static dashboard_state_t s_latest_dashboard_state;
 static bool s_latest_dashboard_state_valid;
 static portMUX_TYPE s_dashboard_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static local_menu_state_t s_local_menu = {
-    .visible = false,
-    .active_screen = LOCAL_SCREEN_MONITOR,
-    .selected_index = 0,
-    .highlight_y_q8 = 0,
-    .highlight_velocity_q8 = 0,
-    .pulse_phase = 0,
-};
-static portMUX_TYPE s_local_menu_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_menu_smoke_demo_started;
-static int64_t s_menu_smoke_demo_started_us;
-static menu_smoke_phase_t s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
 
 extern const uint8_t web_index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t web_index_html_end[] asm("_binary_index_html_end");
@@ -259,12 +213,10 @@ static bool memory_photo_restore_from_nvs(void);
 static bool memory_photo_save_blob(const uint8_t *data, size_t data_len);
 static bool memory_photo_delete_blob(void);
 static bool memory_photo_snapshot(uint16_t *dest, size_t pixel_count);
-static void local_menu_set_active_screen(local_screen_t screen, bool show_menu);
 static void snapshot_dashboard_state(const dashboard_state_t *state);
 static bool read_dashboard_state_snapshot(dashboard_state_t *out);
 static void build_runtime_dashboard_state(dashboard_state_t *state);
 static void fill_smoke_test_sensor_state(dashboard_state_t *state);
-static void local_menu_run_smoke_demo(const dashboard_state_t *state);
 
 static const glyph3x5_t kFont3x5[] = {
     {' ', {0x0, 0x0, 0x0, 0x0, 0x0}}, {'%', {0x5, 0x1, 0x2, 0x4, 0x5}},
@@ -631,7 +583,8 @@ static bool memory_photo_restore_from_nvs(void) {
     return false;
   }
   if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Open memory photo namespace failed: %s", esp_err_to_name(ret));
+    ESP_LOGW(TAG, "Open memory photo namespace failed: %s",
+             esp_err_to_name(ret));
     return false;
   }
 
@@ -694,8 +647,7 @@ static bool memory_photo_save_blob(const uint8_t *data, size_t data_len) {
   }
 
   nvs_handle_t nvs_handle;
-  esp_err_t ret =
-      nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  esp_err_t ret = nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
   if (ret != ESP_OK) {
     ESP_LOGW(TAG, "Open memory photo namespace for write failed: %s",
              esp_err_to_name(ret));
@@ -731,8 +683,7 @@ static bool memory_photo_delete_blob(void) {
   }
 
   nvs_handle_t nvs_handle;
-  esp_err_t ret =
-      nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  esp_err_t ret = nvs_open(MEMORY_PHOTO_NAMESPACE, NVS_READWRITE, &nvs_handle);
   if (ret == ESP_ERR_NVS_NOT_FOUND) {
     s_memory_photo_cache_checked = true;
     memory_photo_clear_cache();
@@ -870,79 +821,6 @@ static bool read_dashboard_state_snapshot(dashboard_state_t *out) {
   return valid;
 }
 
-static int menu_highlight_target_y_q8(int index) {
-  const int row_y[] = {36, 54, 72, 90, 108};
-  int safe_index = clamp_int(index, 0, LOCAL_SCREEN_COUNT - 1);
-  return row_y[safe_index] << 8;
-}
-
-static local_menu_state_t local_menu_snapshot(void) {
-  local_menu_state_t snapshot;
-
-  portENTER_CRITICAL(&s_local_menu_lock);
-  snapshot = s_local_menu;
-  portEXIT_CRITICAL(&s_local_menu_lock);
-  return snapshot;
-}
-
-static void local_menu_set_active_screen(local_screen_t screen, bool show_menu) {
-  int index = clamp_int((int)screen, 0, LOCAL_SCREEN_COUNT - 1);
-
-  portENTER_CRITICAL(&s_local_menu_lock);
-  s_local_menu.active_screen = (local_screen_t)index;
-  s_local_menu.selected_index = index;
-  s_local_menu.visible = show_menu;
-  if (s_local_menu.highlight_y_q8 == 0 || !show_menu) {
-    s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
-    s_local_menu.highlight_velocity_q8 = 0;
-  }
-  portEXIT_CRITICAL(&s_local_menu_lock);
-}
-
-static void local_menu_tick(void) {
-  int target_y_q8;
-  int diff;
-  int accel_q8;
-  int next_y_q8;
-
-  portENTER_CRITICAL(&s_local_menu_lock);
-  target_y_q8 = menu_highlight_target_y_q8(s_local_menu.selected_index);
-  if (s_local_menu.highlight_y_q8 == 0) {
-    s_local_menu.highlight_y_q8 = target_y_q8;
-    s_local_menu.highlight_velocity_q8 = 0;
-  } else {
-    diff = target_y_q8 - s_local_menu.highlight_y_q8;
-    if (abs(diff) <= 2 && abs(s_local_menu.highlight_velocity_q8) <= 2) {
-      s_local_menu.highlight_y_q8 = target_y_q8;
-      s_local_menu.highlight_velocity_q8 = 0;
-    } else {
-      accel_q8 = diff / 3;
-      if (accel_q8 == 0) {
-        accel_q8 = (diff > 0) ? 1 : -1;
-      }
-      s_local_menu.highlight_velocity_q8 += accel_q8;
-      s_local_menu.highlight_velocity_q8 =
-          (s_local_menu.highlight_velocity_q8 * 27) / 32;
-      s_local_menu.highlight_velocity_q8 =
-          clamp_int(s_local_menu.highlight_velocity_q8, -520, 520);
-      next_y_q8 =
-          s_local_menu.highlight_y_q8 + s_local_menu.highlight_velocity_q8;
-
-      if ((diff > 0 && next_y_q8 > target_y_q8 &&
-           s_local_menu.highlight_velocity_q8 > 0) ||
-          (diff < 0 && next_y_q8 < target_y_q8 &&
-           s_local_menu.highlight_velocity_q8 < 0)) {
-        s_local_menu.highlight_y_q8 = target_y_q8;
-        s_local_menu.highlight_velocity_q8 = 0;
-      } else {
-        s_local_menu.highlight_y_q8 = next_y_q8;
-      }
-    }
-  }
-  s_local_menu.pulse_phase = (uint8_t)(s_local_menu.pulse_phase + 1);
-  portEXIT_CRITICAL(&s_local_menu_lock);
-}
-
 static void sanitize_display_text(const char *source, char *dest,
                                   size_t dest_size) {
   size_t write = 0;
@@ -971,108 +849,6 @@ static void sanitize_display_text(const char *source, char *dest,
   }
 
   dest[write] = '\0';
-}
-
-static void local_menu_run_smoke_demo(const dashboard_state_t *state) {
-#if APP_SENSOR_SMOKE_TEST && MENU_SMOKE_AUTOPLAY
-  int64_t now_us;
-  int index;
-  int phase_duration_ms;
-
-  if (state == NULL) {
-    return;
-  }
-
-  if (!s_menu_smoke_demo_started && state->aqi < 5) {
-    return;
-  }
-
-  now_us = esp_timer_get_time();
-  if (!s_menu_smoke_demo_started) {
-    s_menu_smoke_demo_started = true;
-    s_menu_smoke_demo_started_us = now_us;
-    s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
-  }
-
-  phase_duration_ms = MENU_SMOKE_STEP_MS;
-  if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_SCREEN_WIFI) {
-    phase_duration_ms = MENU_SMOKE_WIFI_HOLD_MS;
-  } else if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_SCREEN_MEMORY) {
-    phase_duration_ms = MENU_SMOKE_WIFI_HOLD_MS;
-  } else if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_RETURN_MONITOR) {
-    phase_duration_ms = MENU_SMOKE_MONITOR_RETURN_MS;
-  }
-
-  if (((now_us - s_menu_smoke_demo_started_us) / 1000LL) >= phase_duration_ms) {
-    menu_smoke_phase_t next_phase = (menu_smoke_phase_t)(((int)s_menu_smoke_demo_phase + 1) %
-                                                         MENU_SMOKE_PHASE_COUNT);
-    if (s_menu_smoke_demo_phase == MENU_SMOKE_PHASE_RETURN_MONITOR &&
-        state->aqi < 5) {
-      portENTER_CRITICAL(&s_local_menu_lock);
-      s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
-      s_local_menu.visible = false;
-      s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
-      portEXIT_CRITICAL(&s_local_menu_lock);
-      s_menu_smoke_demo_started = false;
-      s_menu_smoke_demo_started_us = 0;
-      s_menu_smoke_demo_phase = MENU_SMOKE_PHASE_MENU_MONITOR;
-      return;
-    }
-    s_menu_smoke_demo_phase = next_phase;
-    s_menu_smoke_demo_started_us = now_us;
-  }
-
-  portENTER_CRITICAL(&s_local_menu_lock);
-  s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
-  s_local_menu.visible = true;
-
-  switch (s_menu_smoke_demo_phase) {
-  case MENU_SMOKE_PHASE_MENU_MONITOR:
-    s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
-    index = LOCAL_SCREEN_MONITOR;
-    break;
-  case MENU_SMOKE_PHASE_MENU_WIFI:
-    index = LOCAL_SCREEN_WIFI;
-    break;
-  case MENU_SMOKE_PHASE_SCREEN_WIFI:
-    index = LOCAL_SCREEN_WIFI;
-    s_local_menu.visible = false;
-    s_local_menu.active_screen = LOCAL_SCREEN_WIFI;
-    break;
-  case MENU_SMOKE_PHASE_MENU_RETURN_WIFI:
-    index = LOCAL_SCREEN_WIFI;
-    break;
-  case MENU_SMOKE_PHASE_MENU_ALARM:
-    index = LOCAL_SCREEN_ALARM;
-    break;
-  case MENU_SMOKE_PHASE_MENU_GAME:
-    index = LOCAL_SCREEN_GAME;
-    break;
-  case MENU_SMOKE_PHASE_MENU_MEMORY:
-    index = LOCAL_SCREEN_MEMORY;
-    break;
-  case MENU_SMOKE_PHASE_SCREEN_MEMORY:
-    index = LOCAL_SCREEN_MEMORY;
-    s_local_menu.visible = false;
-    s_local_menu.active_screen = LOCAL_SCREEN_MEMORY;
-    break;
-  case MENU_SMOKE_PHASE_RETURN_MONITOR:
-  default:
-    index = LOCAL_SCREEN_MONITOR;
-    s_local_menu.visible = false;
-    s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
-    break;
-  }
-
-  s_local_menu.selected_index = index;
-  if (s_local_menu.highlight_y_q8 == 0) {
-    s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
-    s_local_menu.highlight_velocity_q8 = 0;
-  }
-  portEXIT_CRITICAL(&s_local_menu_lock);
-#else
-  (void)state;
-#endif
 }
 
 static void fill_smoke_test_sensor_state(dashboard_state_t *state) {
@@ -1510,7 +1286,9 @@ static esp_err_t config_memory_post_handler(httpd_req_t *req) {
                              "Failed to save memory photo");
   }
 
-  local_menu_set_active_screen(LOCAL_SCREEN_MEMORY, false);
+  ui_flow_dispatch(&(ui_flow_event_t){
+      .type = UI_FLOW_EVENT_MEMORY_PHOTO_UPDATED,
+  });
   ESP_LOGI(TAG, "Memory photo updated successfully");
   return send_json_message(req, "200 OK", true,
                            "Memory photo updated on device.");
@@ -1521,9 +1299,10 @@ static esp_err_t config_memory_delete_handler(httpd_req_t *req) {
     return send_json_message(req, "500 Internal Server Error", false,
                              "Failed to clear memory photo");
   }
-  local_menu_set_active_screen(LOCAL_SCREEN_MONITOR, false);
-  return send_json_message(req, "200 OK", true,
-                           "Memory photo cleared.");
+  ui_flow_dispatch(&(ui_flow_event_t){
+      .type = UI_FLOW_EVENT_MEMORY_PHOTO_CLEARED,
+  });
+  return send_json_message(req, "200 OK", true, "Memory photo cleared.");
 }
 
 static const char *wifi_auth_mode_to_text(wifi_auth_mode_t auth_mode) {
@@ -3391,7 +3170,7 @@ static void draw_memory_screen(void) {
 
 static void draw_menu_overlay(const local_menu_state_t *menu) {
   static const char *kMenuItems[LOCAL_SCREEN_COUNT] = {
-      "MONITOR", "WIFI CFG", "ALARM", "GAME", "MEMORY"};
+      "MONITOR", "WIFI CONFIG", "ALARM", "GAME", "MEMORY"};
   int panel_x = 0;
   int panel_y = 0;
   int panel_w = TFT_WIDTH;
@@ -3426,7 +3205,7 @@ static void draw_menu_overlay(const local_menu_state_t *menu) {
 }
 
 static void draw_local_screen(const dashboard_state_t *state) {
-  local_menu_state_t menu = local_menu_snapshot();
+  local_menu_state_t menu = ui_flow_snapshot();
 
   switch (menu.active_screen) {
   case LOCAL_SCREEN_MONITOR:
@@ -3710,6 +3489,7 @@ void app_main(void) {
   build_runtime_dashboard_state(&state);
   snapshot_dashboard_state(&state);
   last_sensor_refresh_us = esp_timer_get_time();
+  ui_flow_init();
 
   while (true) {
     int64_t now_us = esp_timer_get_time();
@@ -3720,8 +3500,8 @@ void app_main(void) {
       last_sensor_refresh_us = now_us;
     }
 
-    local_menu_run_smoke_demo(&state);
-    local_menu_tick();
+    ui_flow_update_smoke(state.aqi);
+    ui_flow_tick();
 
 #if SHOW_BITMAP_UI
     draw_local_screen(&state);
