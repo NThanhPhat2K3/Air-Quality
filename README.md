@@ -113,9 +113,40 @@ Sensor data refreshes every 1 s; the framebuffer is pushed to the display every 
 │     · Success → 6 hours                              │
 │     · Failure → 1 minute                             │
 │                                                      │
-│  Fallback: after 3 connect failures or 2 scan misses │
+│  Fallback: after 1 connect failure or 2 scan misses  │
 │  ──► auto-start provisioning AP (AQNODE-XXXXXX)      │
+│  ──► auto-probe STA reconnect every 60 s             │
+│  ──► auto-close portal when WiFi returns              │
 └──────────────────────────────────────────────────────┘
+
+#### Wi-Fi Credential Testing (test-before-save)
+
+When the user submits new Wi-Fi credentials via the web UI, the device does **not** save them immediately. Instead:
+
+1. **Pre-scan** — scan nearby networks (without disconnecting current WiFi). If the target SSID is not visible → return "Network not found" instantly, zero disruption.
+2. **Test connect** — disconnect current WiFi, switch to APSTA mode, attempt connection with the new credentials (15 s timeout, 3 retries).
+3. **Success** — save to NVS → restart device.
+4. **Failure** — restore original STA config and reconnect immediately (~2-5 s). Portal users get their AP restored.
+
+Hidden networks skip the pre-scan step.
+
+#### Auto-Reconnect After WiFi Loss
+
+```
+WiFi lost ──► 10 fast retries (event handler)
+           │
+           └─ all fail ──► 60 s timer ──► 1 sync cycle fail
+                                          │
+                                          └─► auto-open provisioning portal
+                                              (s_provisioning_auto_opened = true)
+                                              │
+                                              └─► probe STA every 60 s
+                                                  │
+                                                  ├─ WiFi back ──► auto-close portal, STA mode
+                                                  └─ WiFi still down ──► keep portal, retry
+```
+
+Manually opened portals (user clicks "Enable Setup Hotspot") do **not** auto-probe — they stay open until the user explicitly stops them.
 ```
 
 ### HTTP API
@@ -128,8 +159,11 @@ Sensor data refreshes every 1 s; the framebuffer is pushed to the display every 
 | GET | `/api/state` | Wi-Fi / provisioning status JSON |
 | GET | `/api/telemetry` | AQI, eCO2, TVOC, temp, humidity JSON |
 | GET | `/api/scan` | Scan nearby Wi-Fi networks |
-| POST | `/api/wifi` | Save Wi-Fi credentials (triggers restart) |
-| POST | `/api/provisioning/start` | Enable AP provisioning hotspot |
+| POST | `/api/wifi` | Test & save Wi-Fi credentials (test-before-save) |
+| POST | `/api/wifi/disconnect` | Disconnect current Wi-Fi (temporary) |
+| POST | `/api/wifi/forget` | Erase saved credentials from NVS + open portal |
+| POST | `/api/provisioning/start` | Enable AP provisioning hotspot (manual) |
+| POST | `/api/provisioning/stop` | Stop provisioning portal + reconnect STA |
 | GET | `/api/memory` | Memory photo status |
 | POST | `/api/memory/photo` | Upload RGB565 photo (40 960 bytes) |
 | DELETE | `/api/memory/photo` | Clear stored photo |
@@ -194,10 +228,30 @@ If no credentials are configured (or connection repeatedly fails), the device cr
 - [x] Dashboard with AQI gauge, clock, eCO2/temp/humidity
 - [x] Wi-Fi STA with auto-reconnect & SNTP time sync
 - [x] Provisioning portal (AP + captive DNS + web UI)
+- [x] Wi-Fi credential test-before-save (pre-scan + APSTA test)
+- [x] Auto-reconnect with STA probe during auto-opened portal
+- [x] Wi-Fi management API (disconnect / forget / stop provisioning)
 - [x] Memory photo upload/display via web
 - [x] Menu system with animated highlight
 - [x] mDNS (`aqnode.local`)
 - [ ] Real sensor integration (ENS160 + AHT21)
+
+## Wi-Fi Behavior Summary
+
+| Scenario | What Happens |
+|----------|-------------|
+| Boot, no credentials | Portal opens, user enters WiFi via web UI |
+| Boot, WiFi available | Connect → sync time → timer 6 h |
+| Boot, WiFi unavailable | 1 fail cycle → auto-portal + probe every 60 s |
+| Running, WiFi drops briefly | 10 fast retries → reconnect |
+| Running, WiFi drops long | 10 retries → 60 s timer → auto-portal + probe |
+| Auto-portal, WiFi returns | Probe succeeds → auto-close portal → STA mode |
+| User opens portal manually | Portal stays until user stops it (no auto-probe) |
+| User submits wrong WiFi | Pre-scan rejects unknown SSID instantly; wrong password restores original WiFi in ~5 s |
+| User submits correct WiFi | Test OK → save NVS → restart |
+| User clicks Disconnect | Temporary disconnect, reconnects on next timer |
+| User clicks Forget | Erase NVS → portal opens for new credentials |
+| User clicks Stop Provisioning | Close portal → trigger reconnect |
 - [ ] Alarm functionality
 - [ ] Mini-game implementation
 - [ ] Button/input hardware integration

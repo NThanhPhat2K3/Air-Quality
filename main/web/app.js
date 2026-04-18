@@ -33,6 +33,10 @@ const memorySelection = document.getElementById("memorySelection");
 const tabButtons = [...document.querySelectorAll(".tab-btn")];
 const tabPanels = [...document.querySelectorAll(".tab-panel")];
 
+const disconnectBtn = document.getElementById("disconnectBtn");
+const forgetBtn = document.getElementById("forgetBtn");
+const stopPortalBtn = document.getElementById("stopPortalBtn");
+
 const alarmTime = document.getElementById("alarmTime");
 const alarmMessage = document.getElementById("alarmMessage");
 const alarmSaveBtn = document.getElementById("alarmSaveBtn");
@@ -111,6 +115,9 @@ function ensureUiBindings() {
     [memoryStatus, "memoryStatus"],
     [memoryInfo, "memoryInfo"],
     [memorySelection, "memorySelection"],
+    [disconnectBtn, "disconnectBtn"],
+    [forgetBtn, "forgetBtn"],
+    [stopPortalBtn, "stopPortalBtn"],
     [alarmTime, "alarmTime"],
     [alarmMessage, "alarmMessage"],
     [alarmSaveBtn, "alarmSaveBtn"],
@@ -640,7 +647,7 @@ function bindUiEvents() {
     }
 
     saveBtn.disabled = true;
-    setStatus("Saving Wi-Fi credentials...", "warn");
+    setStatus("Testing Wi-Fi connection (up to 15s)...", "warn");
 
     try {
       const body = new URLSearchParams();
@@ -650,22 +657,35 @@ function bindUiEvents() {
         body.set("hidden", "1");
       }
 
-      const result = await fetchJson("/api/wifi", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: body.toString(),
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 25000);
 
-      const message = result.message || "Saved. Device restarting.";
+      let result;
+      try {
+        result = await fetchJson("/api/wifi", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const message = result.message || "Connected! Credentials saved.";
       resetWifiFormDirty();
       setStatus(message, "ok");
       if (!message.toLowerCase().includes("restart")) {
         saveBtn.disabled = false;
       }
     } catch (error) {
-      setStatus(error.message, "bad");
+      if (error.name === "AbortError") {
+        setStatus("Request timed out. The device may still be testing.", "bad");
+      } else {
+        setStatus(error.message, "bad");
+      }
       saveBtn.disabled = false;
     }
   });
@@ -740,6 +760,49 @@ function bindUiEvents() {
     } catch (error) {
       setStatus(error.message, "bad");
     } finally {
+      await loadState().catch(() => {});
+    }
+  });
+
+  disconnectBtn.addEventListener("click", async () => {
+    disconnectBtn.disabled = true;
+    setStatus("Disconnecting Wi-Fi...", "warn");
+    try {
+      const result = await fetchJson("/api/wifi/disconnect", { method: "POST" });
+      setStatus(result.message || "Wi-Fi disconnected.", "ok");
+    } catch (error) {
+      setStatus(error.message, "bad");
+    } finally {
+      disconnectBtn.disabled = false;
+      await loadState().catch(() => {});
+    }
+  });
+
+  forgetBtn.addEventListener("click", async () => {
+    if (!confirm("Erase saved Wi-Fi credentials from device? You will need to re-enter them.")) return;
+    forgetBtn.disabled = true;
+    setStatus("Erasing credentials...", "warn");
+    try {
+      const result = await fetchJson("/api/wifi/forget", { method: "POST" });
+      setStatus(result.message || "Credentials erased.", "ok");
+    } catch (error) {
+      setStatus(error.message, "bad");
+    } finally {
+      forgetBtn.disabled = false;
+      await loadState().catch(() => {});
+    }
+  });
+
+  stopPortalBtn.addEventListener("click", async () => {
+    stopPortalBtn.disabled = true;
+    setStatus("Stopping provisioning portal...", "warn");
+    try {
+      const result = await fetchJson("/api/provisioning/stop", { method: "POST" });
+      setStatus(result.message || "Provisioning stopped.", "ok");
+    } catch (error) {
+      setStatus(error.message, "bad");
+    } finally {
+      stopPortalBtn.disabled = false;
       await loadState().catch(() => {});
     }
   });

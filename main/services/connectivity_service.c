@@ -60,10 +60,13 @@
 #define WIFI_SCAN_MAX_RESULTS 24
 #define WIFI_SCAN_JSON_MAX_LEN 4096
 #define WIFI_STATE_JSON_MAX_LEN 1024
-#define WIFI_CONNECT_FAIL_PORTAL_THRESHOLD 3
+#define WIFI_CONNECT_FAIL_PORTAL_THRESHOLD 1
 #define WIFI_TARGET_MISSING_PORTAL_THRESHOLD 2
 #define MEMORY_PHOTO_JSON_MAX_LEN 256
 #define RUNTIME_MDNS_INSTANCE "AQ Node"
+#define WIFI_TEST_CONNECT_TIMEOUT_MS 15000
+#define WIFI_TEST_MAX_RETRY 3
+#define WIFI_AUTO_RECONNECT_PROBE_TIMEOUT_MS 15000
 
 typedef struct {
   char ssid[33];
@@ -99,6 +102,7 @@ static bool s_wifi_should_connect;
 static bool s_wifi_driver_ready;
 static bool s_wifi_credentials_loaded;
 static bool s_provisioning_portal_active;
+static bool s_provisioning_auto_opened;
 static bool s_restart_scheduled;
 static bool s_mdns_ready;
 static int64_t s_last_credentials_write_us;
@@ -115,9 +119,19 @@ extern const uint8_t web_app_css_end[] asm("_binary_app_css_end");
 extern const uint8_t web_app_js_start[] asm("_binary_app_js_start");
 extern const uint8_t web_app_js_end[] asm("_binary_app_js_end");
 
+typedef enum {
+  WIFI_TEST_RESULT_CONNECTED = 0,
+  WIFI_TEST_RESULT_WRONG_PASSWORD,
+  WIFI_TEST_RESULT_NOT_FOUND,
+  WIFI_TEST_RESULT_TIMEOUT,
+  WIFI_TEST_RESULT_ERROR,
+} wifi_test_result_t;
+
 static void schedule_clock_sync_retry(uint32_t delay_ms);
 static void wifi_refresh_credentials_cache(void);
+static void wifi_clear_status_bits(void);
 static bool start_provisioning_portal(void);
+static bool stop_provisioning_portal(void);
 static void fill_sta_wifi_config(wifi_config_t *wifi_config);
 static void ensure_mdns_service(void);
 static wifi_target_scan_result_t wifi_scan_for_target_ssid(void);
@@ -293,9 +307,159 @@ static void wifi_refresh_credentials_cache(void) {
   s_wifi_credentials_loaded = true;
 }
 
+static esp_err_t wifi_erase_credentials_nvs(void) {
+  nvs_handle_t nvs_handle;
+  esp_err_t ret =
+      nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+  ret = nvs_erase_all(nvs_handle);
+  if (ret == ESP_OK) {
+    ret = nvs_commit(nvs_handle);
+  }
+  nvs_close(nvs_handle);
+
+  if (ret == ESP_OK) {
+    wifi_set_credentials_cache("", "", false, false);
+    s_wifi_credentials_loaded = false;
+    ESP_LOGI(TAG, "Wi-Fi credentials erased from NVS");
+  }
+  return ret;
+}
+
 static bool wifi_credentials_configured(void) {
   wifi_refresh_credentials_cache();
   return s_wifi_credentials.valid;
+}
+
+static wifi_test_result_t wifi_test_credentials(const char *ssid,
+                                                const char *password,
+                                                bool hidden) {
+  wifi_test_result_t result = WIFI_TEST_RESULT_ERROR;
+
+  if (!s_wifi_driver_ready || s_wifi_event_group == NULL) {
+    return WIFI_TEST_RESULT_ERROR;
+  }
+
+  wifi_config_t test_config = {0};
+  test_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+  test_config.sta.pmf_cfg.capable = true;
+  test_config.sta.pmf_cfg.required = false;
+  strlcpy((char *)test_config.sta.ssid, ssid,
+          sizeof(test_config.sta.ssid));
+  if (password != NULL) {
+    strlcpy((char *)test_config.sta.password, password,
+            sizeof(test_config.sta.password));
+  }
+  if (password == NULL || password[0] == '\0') {
+    test_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+  }
+
+  /* pre-scan: check target SSID exists WITHOUT disconnecting current WiFi */
+  if (!hidden) {
+    wifi_scan_config_t pre_scan = {
+        .ssid = NULL, .bssid = NULL, .channel = 0,
+        .show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    esp_err_t scan_ret = esp_wifi_scan_start(&pre_scan, true);
+    if (scan_ret == ESP_ERR_WIFI_STATE) {
+      esp_wifi_scan_stop();
+      scan_ret = esp_wifi_scan_start(&pre_scan, true);
+    }
+    if (scan_ret == ESP_OK) {
+      uint16_t ap_count = 0;
+      esp_wifi_scan_get_ap_num(&ap_count);
+      if (ap_count > WIFI_SCAN_MAX_RESULTS) ap_count = WIFI_SCAN_MAX_RESULTS;
+      wifi_ap_record_t *aps = calloc(ap_count, sizeof(wifi_ap_record_t));
+      bool found = false;
+      if (aps != NULL) {
+        esp_wifi_scan_get_ap_records(&ap_count, aps);
+        for (uint16_t i = 0; i < ap_count; ++i) {
+          if (strcmp((const char *)aps[i].ssid, ssid) == 0) {
+            found = true;
+            break;
+          }
+        }
+        free(aps);
+      }
+      if (!found) {
+        ESP_LOGW(TAG, "wifi_test: SSID '%s' not visible in pre-scan, "
+                      "skip connect test", ssid);
+        return WIFI_TEST_RESULT_NOT_FOUND;
+      }
+      ESP_LOGI(TAG, "wifi_test: SSID '%s' found in pre-scan, proceed", ssid);
+    }
+  }
+
+  /* disconnect current STA, keep AP alive for web UI */
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "wifi_test: set_mode APSTA failed: %s",
+             esp_err_to_name(ret));
+    return WIFI_TEST_RESULT_ERROR;
+  }
+
+  ret = esp_wifi_set_config(WIFI_IF_STA, &test_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "wifi_test: set_config failed: %s", esp_err_to_name(ret));
+    return WIFI_TEST_RESULT_ERROR;
+  }
+
+  /* allow only limited retries during the test */
+  s_wifi_retry_num = WIFI_MAXIMUM_RETRY - WIFI_TEST_MAX_RETRY;
+  s_wifi_should_connect = true;
+  wifi_clear_status_bits();
+
+  ret = esp_wifi_connect();
+  if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+    ESP_LOGE(TAG, "wifi_test: connect failed: %s", esp_err_to_name(ret));
+    s_wifi_should_connect = false;
+    return WIFI_TEST_RESULT_ERROR;
+  }
+
+  ESP_LOGI(TAG, "wifi_test: testing credentials for SSID '%s'...", ssid);
+
+  EventBits_t bits = xEventGroupWaitBits(
+      s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE,
+      pdFALSE, pdMS_TO_TICKS(WIFI_TEST_CONNECT_TIMEOUT_MS));
+
+  if ((bits & WIFI_CONNECTED_BIT) != 0) {
+    ESP_LOGI(TAG, "wifi_test: credentials verified OK");
+    return WIFI_TEST_RESULT_CONNECTED;
+  }
+
+  /* test failed — disconnect and restore AP-only state */
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
+  s_wifi_retry_num = 0;
+
+  if ((bits & WIFI_FAIL_BIT) != 0) {
+    ESP_LOGW(TAG, "wifi_test: connection rejected (wrong password or auth)");
+    result = WIFI_TEST_RESULT_WRONG_PASSWORD;
+  } else {
+    ESP_LOGW(TAG, "wifi_test: connection timed out");
+    result = WIFI_TEST_RESULT_TIMEOUT;
+  }
+
+  /* restore provisioning AP if it was active, otherwise reconnect STA */
+  if (s_provisioning_portal_active) {
+    start_provisioning_portal();
+  } else {
+    /* restore STA to original credentials and reconnect immediately */
+    wifi_config_t orig = {0};
+    fill_sta_wifi_config(&orig);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &orig);
+    s_wifi_should_connect = true;
+    wifi_clear_status_bits();
+    esp_wifi_connect();
+  }
+  return result;
 }
 
 static bool is_system_time_valid(void) {
@@ -980,6 +1144,28 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
                              "Invalid control character in input");
   }
 
+  /* test connection before saving to prevent bricking */
+  wifi_test_result_t test = wifi_test_credentials(ssid, password, hidden);
+  if (test != WIFI_TEST_RESULT_CONNECTED) {
+    const char *reason;
+    switch (test) {
+    case WIFI_TEST_RESULT_WRONG_PASSWORD:
+      reason = "Connection failed. Check your password and try again.";
+      break;
+    case WIFI_TEST_RESULT_NOT_FOUND:
+      reason = "Network not found. Check SSID and try again.";
+      break;
+    case WIFI_TEST_RESULT_TIMEOUT:
+      reason = "Connection timed out. The network may be out of range.";
+      break;
+    default:
+      reason = "Connection test failed. Please try again.";
+      break;
+    }
+    ESP_LOGW(TAG, "Wi-Fi test failed for SSID '%s': %s", ssid, reason);
+    return send_json_message(req, "422 Unprocessable Entity", false, reason);
+  }
+
   bool did_write = false;
   esp_err_t ret =
       wifi_save_credentials_to_nvs(ssid, password, hidden, &did_write);
@@ -995,17 +1181,19 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
 
   if (!did_write) {
     return send_json_message(req, "200 OK", true,
-                             "Credentials unchanged. Flash write skipped.");
+                             "Credentials verified and unchanged.");
   }
 
-  ESP_LOGI(TAG, "Wi-Fi credentials saved (ssid=%s, hidden=%d). Restarting...",
+  ESP_LOGI(TAG, "Wi-Fi credentials verified and saved (ssid=%s, hidden=%d). "
+                "Restarting...",
            ssid, hidden);
   schedule_delayed_restart();
   return send_json_message(req, "200 OK", true,
-                           "Saved. Device restarting now.");
+                           "Connected! Credentials saved. Device restarting.");
 }
 
 static esp_err_t config_provisioning_start_post_handler(httpd_req_t *req) {
+  s_provisioning_auto_opened = false;
   if (!wifi_credentials_configured()) {
     if (!start_provisioning_portal()) {
       return send_json_message(req, "500 Internal Server Error", false,
@@ -1020,6 +1208,53 @@ static esp_err_t config_provisioning_start_post_handler(httpd_req_t *req) {
   }
   return send_json_message(req, "200 OK", true,
                            "Setup hotspot enabled for Wi-Fi change.");
+}
+
+static esp_err_t config_provisioning_stop_post_handler(httpd_req_t *req) {
+  if (!s_provisioning_portal_active) {
+    return send_json_message(req, "200 OK", true,
+                             "Provisioning portal is not active.");
+  }
+  if (!stop_provisioning_portal()) {
+    return send_json_message(req, "400 Bad Request", false,
+                             "Cannot stop: no Wi-Fi credentials configured");
+  }
+  return send_json_message(req, "200 OK", true,
+                           "Provisioning portal stopped.");
+}
+
+static esp_err_t config_wifi_disconnect_post_handler(httpd_req_t *req) {
+  if (!connectivity_service_is_wifi_connected()) {
+    return send_json_message(req, "200 OK", true,
+                             "Wi-Fi is already disconnected.");
+  }
+  s_wifi_should_connect = false;
+  esp_err_t ret = esp_wifi_disconnect();
+  if (ret != ESP_OK) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to disconnect Wi-Fi");
+  }
+  ESP_LOGI(TAG, "Wi-Fi disconnected by user request");
+  return send_json_message(req, "200 OK", true, "Wi-Fi disconnected.");
+}
+
+static esp_err_t config_wifi_forget_post_handler(httpd_req_t *req) {
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
+
+  esp_err_t ret = wifi_erase_credentials_nvs();
+  if (ret != ESP_OK) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to erase credentials");
+  }
+
+  if (!start_provisioning_portal()) {
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to start setup hotspot");
+  }
+  ESP_LOGI(TAG, "Wi-Fi credentials forgotten, provisioning portal started");
+  return send_json_message(req, "200 OK", true,
+                           "Credentials erased. Setup hotspot is active.");
 }
 
 static bool start_config_http_server(void) {
@@ -1081,6 +1316,15 @@ static bool start_config_http_server(void) {
       {.uri = "/api/provisioning/start",
        .method = HTTP_POST,
        .handler = config_provisioning_start_post_handler},
+      {.uri = "/api/provisioning/stop",
+       .method = HTTP_POST,
+       .handler = config_provisioning_stop_post_handler},
+      {.uri = "/api/wifi/disconnect",
+       .method = HTTP_POST,
+       .handler = config_wifi_disconnect_post_handler},
+      {.uri = "/api/wifi/forget",
+       .method = HTTP_POST,
+       .handler = config_wifi_forget_post_handler},
       {.uri = "/api/memory",
        .method = HTTP_GET,
        .handler = config_memory_get_handler},
@@ -1164,7 +1408,11 @@ static bool start_provisioning_portal(void) {
     fill_sta_wifi_config(&sta_config);
   }
 
-  s_wifi_should_connect = has_credentials;
+  /* stop any in-flight STA connection so set_config won't fail */
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(100));
+
   wifi_clear_status_bits();
 
   esp_err_t ret =
@@ -1184,11 +1432,16 @@ static bool start_provisioning_portal(void) {
   if (has_credentials) {
     ret = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (ret != ESP_OK) {
-      ESP_LOGE(TAG, "esp_wifi_set_config(STA) failed: %s",
+      ESP_LOGW(TAG, "esp_wifi_set_config(STA) in portal failed: %s, "
+                    "continuing AP-only",
                esp_err_to_name(ret));
-      return false;
+      /* fall back to AP-only so the user can still reconfigure */
+      esp_wifi_set_mode(WIFI_MODE_AP);
+      has_credentials = false;
     }
   }
+
+  s_wifi_should_connect = has_credentials;
 
   ret = esp_wifi_start();
   if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
@@ -1217,6 +1470,38 @@ static bool start_provisioning_portal(void) {
            "Provisioning portal active. Connect SSID '%s' (pass '%s') and open "
            "http://192.168.4.1",
            s_provisioning_ap_ssid, WIFI_PROVISIONING_AP_PASS);
+  return true;
+}
+
+static bool stop_provisioning_portal(void) {
+  if (!s_provisioning_portal_active) {
+    return true;
+  }
+  if (!wifi_credentials_configured()) {
+    ESP_LOGW(TAG, "Cannot stop provisioning: no credentials configured");
+    return false;
+  }
+
+  s_provisioning_portal_active = false;
+  s_provisioning_auto_opened = false;
+  s_wifi_connect_fail_cycles = 0;
+  s_wifi_target_missing_cycles = 0;
+
+  captive_dns_stop();
+
+  if (connectivity_service_is_wifi_connected()) {
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGI(TAG, "Provisioning portal stopped, AP disabled");
+  } else {
+    if (s_clock_sync_task_handle != NULL) {
+      xTaskNotifyGive(s_clock_sync_task_handle);
+      ESP_LOGI(TAG,
+               "Provisioning portal stopped, triggering Wi-Fi reconnect");
+    } else {
+      ESP_LOGI(TAG, "Provisioning portal stopped, restarting device");
+      schedule_delayed_restart();
+    }
+  }
   return true;
 }
 
@@ -1600,8 +1885,12 @@ static wifi_connect_result_t wifi_start_and_wait_for_connection(void) {
   if ((bits & WIFI_FAIL_BIT) != 0) {
     ESP_LOGW(TAG, "Wi-Fi connect failed after retries");
   } else {
-    ESP_LOGW(TAG, "Wi-Fi connect timeout, keep auto-connect enabled");
+    ESP_LOGW(TAG, "Wi-Fi connect timeout");
   }
+
+  /* stop STA so it doesn't block future set_config calls */
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
   return WIFI_CONNECT_RESULT_FAILED;
 }
 
@@ -1642,7 +1931,42 @@ static bool run_clock_sync_cycle(void) {
   }
 
   if (s_provisioning_portal_active) {
-    return false;
+    if (!s_provisioning_auto_opened) {
+      return false;
+    }
+
+    /* Auto-opened portal: probe STA reconnect while keeping AP alive */
+    ESP_LOGI(TAG, "Auto-portal active: probing STA reconnect...");
+    s_wifi_retry_num = 0;
+    s_wifi_should_connect = true;
+    wifi_clear_status_bits();
+
+    esp_err_t probe_ret = esp_wifi_connect();
+    if (probe_ret != ESP_OK && probe_ret != ESP_ERR_WIFI_CONN) {
+      ESP_LOGW(TAG, "STA probe connect failed: %s",
+               esp_err_to_name(probe_ret));
+      s_wifi_should_connect = false;
+      return false;
+    }
+
+    EventBits_t probe_bits = xEventGroupWaitBits(
+        s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE,
+        pdFALSE, pdMS_TO_TICKS(WIFI_AUTO_RECONNECT_PROBE_TIMEOUT_MS));
+
+    if (!(probe_bits & WIFI_CONNECTED_BIT)) {
+      ESP_LOGI(TAG, "STA probe failed, portal stays active");
+      s_wifi_should_connect = false;
+      return false;
+    }
+
+    /* STA reconnected — close auto-portal */
+    ESP_LOGI(TAG, "STA reconnected while portal active, auto-closing portal");
+    s_provisioning_portal_active = false;
+    s_provisioning_auto_opened = false;
+    captive_dns_stop();
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    ensure_runtime_config_server();
+    /* fall through to time sync */
   }
 
   connect_result = wifi_start_and_wait_for_connection();
@@ -1658,6 +1982,7 @@ static bool run_clock_sync_cycle(void) {
         ESP_LOGW(TAG, "Configured SSID stayed missing across scans; switch to "
                       "setup hotspot");
         if (!s_provisioning_portal_active && start_provisioning_portal()) {
+          s_provisioning_auto_opened = true;
           s_wifi_target_missing_cycles = 0;
         } else if (!s_provisioning_portal_active) {
           ESP_LOGE(TAG,
@@ -1677,6 +2002,7 @@ static bool run_clock_sync_cycle(void) {
             TAG,
             "Auto-enable setup hotspot after repeated connection failures");
         if (start_provisioning_portal()) {
+          s_provisioning_auto_opened = true;
           s_wifi_connect_fail_cycles = 0;
         } else {
           ESP_LOGE(TAG, "Failed to auto-start setup hotspot");
@@ -1728,20 +2054,14 @@ void connectivity_service_setup_and_clock(void) {
     return;
   }
 
-  if (!wifi_credentials_configured()) {
-    if (!start_provisioning_portal()) {
-      ESP_LOGE(TAG, "Failed to start provisioning portal");
-    }
-    return;
-  }
-
+  /* Always create clock_sync_task + timer so reconnect/probe works
+     even when credentials are added later via the provisioning portal. */
   if (s_clock_sync_task_handle == NULL) {
     BaseType_t task_ok = xTaskCreate(clock_sync_task, "clock_sync", 4096, NULL,
                                      5, &s_clock_sync_task_handle);
     if (task_ok != pdPASS) {
       ESP_LOGE(TAG, "Failed to create clock sync task");
       s_clock_sync_task_handle = NULL;
-      return;
     }
   }
 
@@ -1750,8 +2070,14 @@ void connectivity_service_setup_and_clock(void) {
                                       pdFALSE, NULL, clock_sync_timer_callback);
     if (s_clock_sync_timer == NULL) {
       ESP_LOGE(TAG, "Failed to create clock sync timer");
-      return;
     }
+  }
+
+  if (!wifi_credentials_configured()) {
+    if (!start_provisioning_portal()) {
+      ESP_LOGE(TAG, "Failed to start provisioning portal");
+    }
+    return;
   }
 
   xEventGroupClearBits(s_wifi_event_group,
@@ -1780,6 +2106,27 @@ void connectivity_service_set_time_synced(bool time_synced) {
   portENTER_CRITICAL(&s_connectivity_state_lock);
   s_time_synced = time_synced;
   portEXIT_CRITICAL(&s_connectivity_state_lock);
+}
+
+bool connectivity_service_disconnect_wifi(void) {
+  if (!connectivity_service_is_wifi_connected()) {
+    return true;
+  }
+  s_wifi_should_connect = false;
+  return esp_wifi_disconnect() == ESP_OK;
+}
+
+bool connectivity_service_stop_provisioning(void) {
+  return stop_provisioning_portal();
+}
+
+bool connectivity_service_forget_credentials(void) {
+  s_wifi_should_connect = false;
+  esp_wifi_disconnect();
+  if (wifi_erase_credentials_nvs() != ESP_OK) {
+    return false;
+  }
+  return start_provisioning_portal();
 }
 
 void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {

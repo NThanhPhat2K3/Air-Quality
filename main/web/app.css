@@ -729,6 +729,22 @@ input:focus {
   color: var(--text);
 }
 
+.btn.danger {
+  border-color: var(--bad);
+  background: transparent;
+  color: var(--bad);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: rgba(255, 125, 125, 0.12);
+}
+
+.wifi-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
