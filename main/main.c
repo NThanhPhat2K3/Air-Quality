@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "captive_dns.h"
+#include "dashboard_state.h"
 #include "display_hal.h"
 #include "ui_flow.h"
 #include "esp_err.h"
@@ -32,13 +33,6 @@
 #define DEG_TO_RAD 0.01745329252f
 // 1 = use hybrid runtime UI (black background + data cards).
 #define SHOW_BITMAP_UI 1
-// 1 = use stubbed sensor values for bring-up/smoke testing before real
-// hardware.
-#define APP_SENSOR_SMOKE_TEST 1
-// Only used when APP_SENSOR_SMOKE_TEST=1.
-// 1 = cycle stub AQI values through all thresholds so the UI can be reviewed.
-#define DEMO_AQI_SWEEP 1
-#define DEMO_AQI_STEP_SECONDS 6
 #define DASHBOARD_SENSOR_REFRESH_MS 1000
 #define DISPLAY_FRAME_INTERVAL_MS 20
 
@@ -98,16 +92,6 @@ typedef struct {
 } star_t;
 
 typedef struct {
-  struct tm clock;
-  int aqi;
-  int eco2_ppm;
-  int tvoc_ppb;
-  int ens_validity;
-  int temp_tenths_c;
-  int humidity_pct;
-} dashboard_state_t;
-
-typedef struct {
   char ssid[33];
   char password[65];
   bool hidden;
@@ -152,9 +136,6 @@ static SemaphoreHandle_t s_memory_photo_mutex;
 static uint16_t s_memory_photo[TFT_WIDTH * TFT_HEIGHT];
 static bool s_memory_photo_loaded;
 static bool s_memory_photo_cache_checked;
-static dashboard_state_t s_latest_dashboard_state;
-static bool s_latest_dashboard_state_valid;
-static portMUX_TYPE s_dashboard_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 extern const uint8_t web_index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t web_index_html_end[] asm("_binary_index_html_end");
@@ -175,10 +156,6 @@ static bool memory_photo_restore_from_nvs(void);
 static bool memory_photo_save_blob(const uint8_t *data, size_t data_len);
 static bool memory_photo_delete_blob(void);
 static bool memory_photo_snapshot(uint16_t *dest, size_t pixel_count);
-static void snapshot_dashboard_state(const dashboard_state_t *state);
-static bool read_dashboard_state_snapshot(dashboard_state_t *out);
-static void build_runtime_dashboard_state(dashboard_state_t *state);
-static void fill_smoke_test_sensor_state(dashboard_state_t *state);
 
 static const glyph3x5_t kFont3x5[] = {
     {' ', {0x0, 0x0, 0x0, 0x0, 0x0}}, {'%', {0x5, 0x1, 0x2, 0x4, 0x5}},
@@ -714,32 +691,6 @@ static bool wifi_link_is_up(void) {
   return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
-static void snapshot_dashboard_state(const dashboard_state_t *state) {
-  if (state == NULL) {
-    return;
-  }
-
-  portENTER_CRITICAL(&s_dashboard_state_lock);
-  s_latest_dashboard_state = *state;
-  s_latest_dashboard_state_valid = true;
-  portEXIT_CRITICAL(&s_dashboard_state_lock);
-}
-
-static bool read_dashboard_state_snapshot(dashboard_state_t *out) {
-  if (out == NULL) {
-    return false;
-  }
-
-  bool valid = false;
-  portENTER_CRITICAL(&s_dashboard_state_lock);
-  if (s_latest_dashboard_state_valid) {
-    *out = s_latest_dashboard_state;
-    valid = true;
-  }
-  portEXIT_CRITICAL(&s_dashboard_state_lock);
-  return valid;
-}
-
 static void sanitize_display_text(const char *source, char *dest,
                                   size_t dest_size) {
   size_t write = 0;
@@ -768,54 +719,6 @@ static void sanitize_display_text(const char *source, char *dest,
   }
 
   dest[write] = '\0';
-}
-
-static void fill_smoke_test_sensor_state(dashboard_state_t *state) {
-  int elapsed;
-  int temp_wave;
-  int hum_wave;
-  int eco2_wave;
-  int tvoc_wave;
-
-  if (state == NULL) {
-    return;
-  }
-
-  // This block is intentionally stubbed for smoke testing.
-  // When real sensors are wired in, replace this function with hardware reads.
-  elapsed = (int)(esp_timer_get_time() / 1000000LL);
-  temp_wave = (elapsed % 9) - 4;
-  hum_wave = (elapsed % 7) - 3;
-  eco2_wave = (elapsed % 11) - 5;
-  tvoc_wave = (elapsed % 13) - 6;
-
-#if DEMO_AQI_SWEEP
-  {
-    static const int kDemoAqiLevels[] = {1, 2, 3, 4, 5};
-    static const int kDemoEco2Levels[] = {420, 720, 950, 1300, 1800};
-    static const int kDemoTvocLevels[] = {35, 120, 260, 420, 650};
-    int stage = (elapsed / DEMO_AQI_STEP_SECONDS) %
-                (int)(sizeof(kDemoAqiLevels) / sizeof(kDemoAqiLevels[0]));
-    state->aqi = kDemoAqiLevels[stage];
-    state->eco2_ppm = kDemoEco2Levels[stage] + (eco2_wave * 2);
-    state->tvoc_ppb = kDemoTvocLevels[stage] + (tvoc_wave * 4);
-    state->ens_validity = 0;
-  }
-#else
-  state->aqi = 2;
-  state->eco2_ppm = 742 + (eco2_wave * 4);
-  state->tvoc_ppb = 145 + (tvoc_wave * 6);
-  if (elapsed < 20) {
-    state->ens_validity = 2;
-  } else if (elapsed < 40) {
-    state->ens_validity = 1;
-  } else {
-    state->ens_validity = 0;
-  }
-#endif
-
-  state->temp_tenths_c = 290 + temp_wave;
-  state->humidity_pct = 63 + hum_wave;
 }
 
 static void delayed_restart_task(void *arg) {
@@ -1151,8 +1054,8 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
 
 static esp_err_t config_telemetry_get_handler(httpd_req_t *req) {
   dashboard_state_t state = {0};
-  if (!read_dashboard_state_snapshot(&state)) {
-    build_runtime_dashboard_state(&state);
+  if (!dashboard_state_snapshot_read(&state)) {
+    dashboard_state_build_runtime(&state, &s_time_synced);
   }
 
   char payload[512];
@@ -3082,61 +2985,6 @@ static void draw_dashboard(const dashboard_state_t *state) {
 
 #endif /* !SHOW_BITMAP_UI */
 
-static void build_runtime_dashboard_state(dashboard_state_t *state) {
-  static bool initialized = false;
-  static time_t base_epoch;
-
-  if (state == NULL) {
-    return;
-  }
-
-  if (!initialized) {
-    struct tm demo_start = {
-        .tm_year = 124,
-        .tm_mon = 3,
-        .tm_mday = 22,
-        .tm_hour = 14,
-        .tm_min = 45,
-        .tm_sec = 23,
-    };
-    base_epoch = mktime(&demo_start);
-    initialized = true;
-  }
-
-  int elapsed = (int)(esp_timer_get_time() / 1000000LL);
-  if (!s_time_synced) {
-    // If SNTP sync finished after initial timeout, auto-switch to real clock.
-    time_t now = 0;
-    time(&now);
-    if (now >= 1700000000) {
-      s_time_synced = true;
-      ESP_LOGI(TAG, "Real time became available, switching from demo clock");
-    }
-  }
-
-  if (s_time_synced) {
-    time_t now = 0;
-    time(&now);
-    localtime_r(&now, &state->clock);
-  } else {
-    time_t current = base_epoch + elapsed;
-    localtime_r(&current, &state->clock);
-  }
-
-#if APP_SENSOR_SMOKE_TEST
-  fill_smoke_test_sensor_state(state);
-#else
-  // TODO: Replace this block with real sensor reads when hardware is ready.
-  // Keep field names stable so the display and webserver do not need changes.
-  state->aqi = 0;
-  state->eco2_ppm = 0;
-  state->tvoc_ppb = 0;
-  state->ens_validity = 3;
-  state->temp_tenths_c = 0;
-  state->humidity_pct = 0;
-#endif
-}
-
 void app_main(void) {
   dashboard_state_t state = {0};
   int64_t last_sensor_refresh_us = 0;
@@ -3169,8 +3017,8 @@ void app_main(void) {
   lcd_present_framebuffer();
   vTaskDelay(pdMS_TO_TICKS(220));
 
-  build_runtime_dashboard_state(&state);
-  snapshot_dashboard_state(&state);
+  dashboard_state_build_runtime(&state, &s_time_synced);
+  dashboard_state_snapshot_store(&state);
   last_sensor_refresh_us = esp_timer_get_time();
   ui_flow_init();
 
@@ -3178,8 +3026,8 @@ void app_main(void) {
     int64_t now_us = esp_timer_get_time();
     if ((now_us - last_sensor_refresh_us) >=
         (DASHBOARD_SENSOR_REFRESH_MS * 1000LL)) {
-      build_runtime_dashboard_state(&state);
-      snapshot_dashboard_state(&state);
+      dashboard_state_build_runtime(&state, &s_time_synced);
+      dashboard_state_snapshot_store(&state);
       last_sensor_refresh_us = now_us;
     }
 
