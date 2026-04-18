@@ -1,0 +1,819 @@
+#include "ui_renderer.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "display_hal.h"
+#include "memory_photo_service.h"
+
+#define DEG_TO_RAD 0.01745329252f
+
+typedef struct {
+  char c;
+  uint8_t rows[5];
+} glyph3x5_t;
+
+typedef struct {
+  char c;
+  uint8_t rows[7];
+} glyph5x7_t;
+
+typedef struct {
+  int8_t x;
+  int8_t y;
+  uint16_t color;
+} star_t;
+
+static const glyph3x5_t kFont3x5[] = {
+    {' ', {0x0, 0x0, 0x0, 0x0, 0x0}}, {'%', {0x5, 0x1, 0x2, 0x4, 0x5}},
+    {'-', {0x0, 0x0, 0x7, 0x0, 0x0}}, {'.', {0x0, 0x0, 0x0, 0x0, 0x2}},
+    {':', {0x0, 0x2, 0x0, 0x2, 0x0}}, {'0', {0x7, 0x5, 0x5, 0x5, 0x7}},
+    {'1', {0x2, 0x6, 0x2, 0x2, 0x7}}, {'2', {0x7, 0x1, 0x7, 0x4, 0x7}},
+    {'3', {0x7, 0x1, 0x7, 0x1, 0x7}}, {'4', {0x5, 0x5, 0x7, 0x1, 0x1}},
+    {'5', {0x7, 0x4, 0x7, 0x1, 0x7}}, {'6', {0x7, 0x4, 0x7, 0x5, 0x7}},
+    {'7', {0x7, 0x1, 0x1, 0x1, 0x1}}, {'8', {0x7, 0x5, 0x7, 0x5, 0x7}},
+    {'9', {0x7, 0x5, 0x7, 0x1, 0x7}}, {'A', {0x7, 0x5, 0x7, 0x5, 0x5}},
+    {'B', {0x6, 0x5, 0x6, 0x5, 0x6}}, {'C', {0x3, 0x4, 0x4, 0x4, 0x3}},
+    {'D', {0x6, 0x5, 0x5, 0x5, 0x6}}, {'E', {0x7, 0x4, 0x6, 0x4, 0x7}},
+    {'F', {0x7, 0x4, 0x6, 0x4, 0x4}}, {'G', {0x3, 0x4, 0x5, 0x5, 0x3}},
+    {'H', {0x5, 0x5, 0x7, 0x5, 0x5}}, {'I', {0x7, 0x2, 0x2, 0x2, 0x7}},
+    {'K', {0x5, 0x5, 0x6, 0x5, 0x5}}, {'L', {0x4, 0x4, 0x4, 0x4, 0x7}},
+    {'M', {0x5, 0x7, 0x7, 0x5, 0x5}}, {'N', {0x5, 0x7, 0x7, 0x7, 0x5}},
+    {'O', {0x7, 0x5, 0x5, 0x5, 0x7}}, {'P', {0x6, 0x5, 0x6, 0x4, 0x4}},
+    {'Q', {0x7, 0x5, 0x5, 0x7, 0x1}}, {'R', {0x6, 0x5, 0x6, 0x5, 0x5}},
+    {'S', {0x7, 0x4, 0x7, 0x1, 0x7}}, {'T', {0x7, 0x2, 0x2, 0x2, 0x2}},
+    {'U', {0x5, 0x5, 0x5, 0x5, 0x7}}, {'V', {0x5, 0x5, 0x5, 0x5, 0x2}},
+    {'W', {0x5, 0x5, 0x7, 0x7, 0x5}}, {'X', {0x5, 0x5, 0x2, 0x5, 0x5}},
+    {'Y', {0x5, 0x5, 0x2, 0x2, 0x2}},
+};
+
+static const glyph5x7_t kFont5x7[] = {
+    {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'%', {0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13}},
+    {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C}},
+    {'/', {0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00}},
+    {':', {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00}},
+    {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+    {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+    {'3', {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E}},
+    {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+    {'5', {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E}},
+    {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+    {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+    {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+    {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'D', {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+    {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
+    {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
+    {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+    {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+    {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+};
+
+static const star_t kStars[] = {
+    {8, 18, RGB565(30, 50, 90)},      {17, 12, RGB565(80, 180, 255)},
+    {22, 73, RGB565(255, 255, 255)},  {29, 24, RGB565(60, 90, 150)},
+    {36, 44, RGB565(255, 220, 120)},  {42, 8, RGB565(180, 210, 255)},
+    {48, 96, RGB565(90, 140, 220)},   {55, 57, RGB565(60, 170, 255)},
+    {61, 16, RGB565(255, 255, 255)},  {68, 84, RGB565(50, 90, 160)},
+    {74, 31, RGB565(255, 205, 80)},   {82, 14, RGB565(40, 110, 255)},
+    {89, 47, RGB565(140, 180, 255)},  {96, 73, RGB565(255, 255, 255)},
+    {104, 12, RGB565(40, 80, 140)},   {110, 54, RGB565(255, 220, 120)},
+    {117, 21, RGB565(80, 160, 255)},  {122, 89, RGB565(40, 70, 130)},
+    {129, 61, RGB565(255, 255, 255)}, {136, 10, RGB565(70, 150, 255)},
+    {142, 32, RGB565(255, 210, 90)},  {148, 73, RGB565(90, 140, 210)},
+    {152, 49, RGB565(255, 255, 255)}, {11, 101, RGB565(70, 140, 220)},
+    {27, 112, RGB565(40, 90, 170)},   {73, 103, RGB565(255, 220, 120)},
+    {99, 102, RGB565(60, 130, 230)},  {145, 101, RGB565(70, 120, 180)},
+};
+
+static const uint16_t COLOR_BG = RGB565(0, 0, 0);
+static const uint16_t COLOR_WHITE = RGB565(245, 248, 255);
+static const uint16_t COLOR_YELLOW = RGB565(255, 220, 60);
+static const uint16_t COLOR_CYAN = RGB565(70, 210, 255);
+static const uint16_t COLOR_PANEL = RGB565(7, 13, 22);
+static const uint16_t COLOR_PANEL_ALT = RGB565(10, 18, 30);
+static const uint16_t COLOR_MUTED = RGB565(160, 180, 200);
+static const uint16_t COLOR_DIVIDER = RGB565(95, 110, 130);
+static const uint16_t COLOR_LIME = RGB565(160, 255, 50);
+static const uint16_t COLOR_GREEN = RGB565(60, 220, 90);
+static const uint16_t COLOR_ORANGE = RGB565(255, 145, 45);
+static const uint16_t COLOR_RED = RGB565(255, 78, 70);
+static const uint16_t COLOR_LIME_SOFT = RGB565(120, 235, 90);
+static const uint16_t COLOR_OLIVE = RGB565(68, 95, 30);
+
+static int clamp_int(int value, int min_value, int max_value) {
+  if (value < min_value) {
+    return min_value;
+  }
+  if (value > max_value) {
+    return max_value;
+  }
+  return value;
+}
+
+static void sanitize_display_text(const char *source, char *dest,
+                                  size_t dest_size) {
+  size_t write = 0;
+
+  if (dest == NULL || dest_size == 0) {
+    return;
+  }
+  if (source == NULL) {
+    dest[0] = '\0';
+    return;
+  }
+
+  while (source[0] != '\0' && write + 1 < dest_size) {
+    unsigned char ch = (unsigned char)*source++;
+    if (ch >= 'a' && ch <= 'z') {
+      ch = (unsigned char)(ch - ('a' - 'A'));
+    }
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == ' ' ||
+        ch == '-' || ch == '.' || ch == '/' || ch == ':') {
+      dest[write++] = (char)ch;
+    } else {
+      dest[write++] = '-';
+    }
+  }
+  dest[write] = '\0';
+}
+
+static const uint8_t *font_lookup(char c) {
+  for (size_t i = 0; i < sizeof(kFont3x5) / sizeof(kFont3x5[0]); ++i) {
+    if (kFont3x5[i].c == c) {
+      return kFont3x5[i].rows;
+    }
+  }
+  return kFont3x5[0].rows;
+}
+
+static const uint8_t *font5x7_lookup(char c) {
+  for (size_t i = 0; i < sizeof(kFont5x7) / sizeof(kFont5x7[0]); ++i) {
+    if (kFont5x7[i].c == c) {
+      return kFont5x7[i].rows;
+    }
+  }
+  return kFont5x7[0].rows;
+}
+
+static int text_width(const char *text, int scale) {
+  return (int)strlen(text) * 4 * scale;
+}
+
+static int text5x7_width(const char *text, int scale) {
+  return (int)strlen(text) * 6 * scale;
+}
+
+static void fb_draw_char(int x, int y, char c, uint16_t color, int scale) {
+  const uint8_t *rows = font_lookup(c);
+
+  for (int row = 0; row < 5; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      if (rows[row] & (1 << (2 - col))) {
+        fb_fill_rect(x + (col * scale), y + (row * scale), scale, scale, color);
+      }
+    }
+  }
+}
+
+static void fb_draw_char5x7(int x, int y, char c, uint16_t color, int scale) {
+  const uint8_t *rows = font5x7_lookup(c);
+
+  for (int row = 0; row < 7; ++row) {
+    for (int col = 0; col < 5; ++col) {
+      if (rows[row] & (1 << (4 - col))) {
+        fb_fill_rect(x + (col * scale), y + (row * scale), scale, scale, color);
+      }
+    }
+  }
+}
+
+static void fb_draw_text(int x, int y, const char *text, uint16_t color,
+                         int scale) {
+  int len = (int)strlen(text);
+  for (int i = 0; i < len; ++i) {
+    fb_draw_char(x + i * 4 * scale, y, text[i], color, scale);
+  }
+}
+
+static void fb_draw_text5x7(int x, int y, const char *text, uint16_t color,
+                            int scale) {
+  int len = (int)strlen(text);
+  for (int i = 0; i < len; ++i) {
+    fb_draw_char5x7(x + i * 6 * scale, y, text[i], color, scale);
+  }
+}
+
+static void fb_draw_text_shadow(int x, int y, const char *text, uint16_t color,
+                                uint16_t shadow_color, int scale) {
+  fb_draw_text(x + 1, y + 1, text, shadow_color, scale);
+  fb_draw_text(x, y, text, color, scale);
+}
+
+static void fb_draw_text5x7_shadow(int x, int y, const char *text,
+                                   uint16_t color, uint16_t shadow_color,
+                                   int scale) {
+  fb_draw_text5x7(x + 1, y + 1, text, shadow_color, scale);
+  fb_draw_text5x7(x, y, text, color, scale);
+}
+
+static void fb_draw_text5x7_centered(int center_x, int y, const char *text,
+                                     uint16_t color, int scale) {
+  fb_draw_text5x7(center_x - text5x7_width(text, scale) / 2, y, text, color,
+                  scale);
+}
+
+static void fb_draw_arc_segment(int cx, int cy, int inner_r, int outer_r,
+                                float start_deg, float end_deg,
+                                uint16_t color) {
+  for (float deg = start_deg; deg <= end_deg; deg += 1.4f) {
+    float rad = deg * DEG_TO_RAD;
+    int x0 = cx + (int)(cosf(rad) * inner_r);
+    int y0 = cy + (int)(sinf(rad) * inner_r);
+    int x1 = cx + (int)(cosf(rad) * outer_r);
+    int y1 = cy + (int)(sinf(rad) * outer_r);
+    fb_draw_line(x0, y0, x1, y1, color);
+  }
+}
+
+static void draw_starry_background(void) {
+  fb_clear(COLOR_BG);
+  fb_fill_circle(28, 24, 17, RGB565(7, 18, 34));
+  fb_fill_circle(118, 35, 22, RGB565(6, 16, 30));
+  fb_fill_circle(95, 92, 26, RGB565(8, 14, 24));
+  for (size_t i = 0; i < sizeof(kStars) / sizeof(kStars[0]); ++i) {
+    fb_draw_pixel(kStars[i].x, kStars[i].y, kStars[i].color);
+  }
+}
+
+static uint16_t aqi_color(int aqi) {
+  if (aqi <= 1) {
+    return COLOR_GREEN;
+  }
+  if (aqi == 2) {
+    return COLOR_LIME;
+  }
+  if (aqi == 3) {
+    return COLOR_YELLOW;
+  }
+  if (aqi == 4) {
+    return COLOR_ORANGE;
+  }
+  return COLOR_RED;
+}
+
+static const char *aqi_label(int aqi) {
+  if (aqi <= 1) {
+    return "EXCLNT";
+  }
+  if (aqi == 2) {
+    return "GOOD";
+  }
+  if (aqi == 3) {
+    return "MODER";
+  }
+  if (aqi == 4) {
+    return "POOR";
+  }
+  return "UNHLTY";
+}
+
+static const char *ens160_validity_label(int validity) {
+  switch (validity) {
+  case 0:
+    return "READY";
+  case 1:
+    return "WARMUP";
+  case 2:
+    return "STARTUP";
+  default:
+    return "CHECK";
+  }
+}
+
+static void aqi_subtext(int aqi, const char **line1, const char **line2) {
+  if (aqi <= 2) {
+    *line1 = "SAFE AIR";
+    *line2 = "LOW RISK";
+    return;
+  }
+  if (aqi == 3) {
+    *line1 = "OPEN AIR";
+    *line2 = "IF NEEDED";
+    return;
+  }
+  if (aqi == 4) {
+    *line1 = "VENTILATE";
+    *line2 = "SOON";
+    return;
+  }
+  *line1 = "CHECK AIR";
+  *line2 = "NOW";
+}
+
+static void draw_wifi_arc_band(int cx, int cy, int inner_radius,
+                               int outer_radius, float start_deg, float end_deg,
+                               uint16_t color) {
+  const float center_deg = (start_deg + end_deg) * 0.5f;
+  const float half_sweep = (end_deg - start_deg) * 0.5f;
+
+  for (float offset = 0.0f; offset <= half_sweep; offset += 1.0f) {
+    float left_rad = (center_deg - offset) * DEG_TO_RAD;
+    float right_rad = (center_deg + offset) * DEG_TO_RAD;
+
+    for (int radius = inner_radius; radius <= outer_radius; ++radius) {
+      int left_x = cx + (int)lroundf(cosf(left_rad) * radius);
+      int left_y = cy + (int)lroundf(sinf(left_rad) * radius);
+      int right_x = cx + (int)lroundf(cosf(right_rad) * radius);
+      int right_y = cy + (int)lroundf(sinf(right_rad) * radius);
+      fb_draw_line(left_x, left_y, right_x, right_y, color);
+    }
+  }
+}
+
+static void draw_wifi_icon(int cx, int cy, uint16_t color) {
+  const int base_y = cy + 8;
+
+  draw_wifi_arc_band(cx, base_y, 6, 7, 222.0f, 318.0f, color);
+  draw_wifi_arc_band(cx, base_y, 3, 4, 228.0f, 312.0f, color);
+  draw_wifi_arc_band(cx, base_y, 1, 2, 238.0f, 302.0f, color);
+  fb_draw_pixel(cx, base_y - 1, color);
+  fb_draw_line(cx - 1, base_y, cx + 1, base_y, color);
+  fb_draw_pixel(cx, base_y + 1, color);
+}
+
+static void draw_wifi_offline_icon(int cx, int cy, uint16_t color,
+                                   uint16_t slash_color) {
+  (void)slash_color;
+  draw_wifi_icon(cx, cy, color);
+}
+
+static void draw_panel(int x, int y, int w, int h, uint16_t accent) {
+  fb_fill_rect(x, y, w, h, COLOR_PANEL);
+  fb_draw_rect(x, y, w, h, COLOR_DIVIDER);
+  fb_fill_rect(x + 1, y + 1, w - 2, 2, accent);
+  fb_fill_rect(x + 1, y + h - 3, w - 2, 2, COLOR_PANEL_ALT);
+}
+
+static void draw_hybrid_metric_card(int x, int w, const char *label,
+                                    const char *value, const char *unit,
+                                    bool show_degree_symbol,
+                                    uint16_t value_color) {
+  const int y = 95;
+  const int h = 29;
+  int value_w = text_width(value, 2);
+  bool compact_unit = (!show_degree_symbol && strlen(value) >= 4);
+  int unit_w = compact_unit ? text_width(unit, 1) : text5x7_width(unit, 1);
+  int degree_gap = show_degree_symbol ? 5 : 0;
+  int unit_total_w = unit_w + degree_gap;
+  int unit_left_x = x + w - unit_total_w - 3;
+  int value_area_left = x + 4;
+  int value_area_right = unit_left_x - 6;
+  int value_x =
+      value_area_left + ((value_area_right - value_area_left) - value_w) / 2;
+  int unit_y = compact_unit ? (y + h - 8) : (y + h - 11);
+
+  if (value_x < value_area_left) {
+    value_x = value_area_left;
+  }
+
+  fb_fill_rect(x, y, w, h, RGB565(6, 14, 28));
+  fb_draw_rect(x, y, w, h, RGB565(30, 92, 146));
+  fb_fill_rect(x + 1, y + 1, w - 2, 2, RGB565(45, 128, 195));
+  fb_draw_text5x7_centered(x + (w / 2), y + 4, label, COLOR_MUTED, 1);
+  fb_draw_text_shadow(value_x, y + 15, value, value_color, RGB565(20, 44, 72),
+                      2);
+  if (show_degree_symbol) {
+    fb_draw_rect(unit_left_x, unit_y + 1, 3, 3, COLOR_CYAN);
+  }
+  if (compact_unit) {
+    fb_draw_text(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, 1);
+  } else {
+    fb_draw_text5x7(unit_left_x + degree_gap, unit_y, unit, COLOR_CYAN, 1);
+  }
+}
+
+static void draw_hybrid_overlay(const dashboard_state_t *state,
+                                bool wifi_connected) {
+  char time_text[16];
+  char date_text[16];
+  char eco2_text[16];
+  char temp_text[16];
+  char hum_text[16];
+  char aqi_text[8];
+  char sensor_line[20];
+  const char *ens_status = ens160_validity_label(state->ens_validity);
+  int day_display = clamp_int(state->clock.tm_mday, 0, 99);
+  int month_display = clamp_int(state->clock.tm_mon + 1, 0, 99);
+  int year_display = clamp_int(state->clock.tm_year + 1900, 0, 9999);
+
+  snprintf(time_text, sizeof(time_text), "%02d:%02d:%02d", state->clock.tm_hour,
+           state->clock.tm_min, state->clock.tm_sec);
+  snprintf(date_text, sizeof(date_text), "%02d/%02d/%04d", day_display,
+           month_display, year_display);
+  snprintf(eco2_text, sizeof(eco2_text), "%d", state->eco2_ppm);
+  snprintf(temp_text, sizeof(temp_text), "%d.%d", state->temp_tenths_c / 10,
+           abs(state->temp_tenths_c % 10));
+  snprintf(hum_text, sizeof(hum_text), "%d", state->humidity_pct);
+  snprintf(aqi_text, sizeof(aqi_text), "%d", state->aqi);
+  snprintf(sensor_line, sizeof(sensor_line), "TVOC %d", state->tvoc_ppb);
+
+  uint16_t aqi_col = aqi_color(state->aqi);
+  const char *aqi_lbl = aqi_label(state->aqi);
+  uint16_t glow = RGB565(16, 34, 55);
+  const int left_header_x = 3;
+  const int left_header_w = 70;
+  const int right_header_x = 73;
+  const int right_header_w = 84;
+  const int time_x = 6;
+  const int time_right_x = time_x + text5x7_width(time_text, 1);
+  const int date_right_x = 153;
+  const int date_x = date_right_x - text5x7_width(date_text, 1);
+  const int wifi_cx = time_right_x + ((date_x - time_right_x) / 2);
+  const int wifi_cy = 5;
+
+  fb_clear(COLOR_BG);
+  fb_fill_rect(2, 2, 156, 17, RGB565(4, 10, 20));
+  fb_draw_rect(2, 2, 156, 17, RGB565(26, 70, 120));
+  fb_fill_rect(left_header_x, 3, left_header_w, 15, RGB565(8, 22, 38));
+  fb_fill_rect(right_header_x, 3, right_header_w, 15, RGB565(18, 20, 34));
+  fb_draw_text5x7_shadow(time_x, 6, time_text, COLOR_CYAN, RGB565(8, 28, 42),
+                         1);
+  if (wifi_connected) {
+    draw_wifi_icon(wifi_cx, wifi_cy, COLOR_LIME);
+  } else {
+    draw_wifi_offline_icon(wifi_cx, wifi_cy, COLOR_MUTED, COLOR_RED);
+  }
+  fb_draw_text5x7(date_x, 6, date_text, COLOR_YELLOW, 1);
+
+  {
+    const int px = 4, py = 23, pw = 58, ph = 69;
+    const int cx = px + pw / 2;
+    draw_panel(px, py, pw, ph, aqi_col);
+    fb_draw_text5x7_centered(cx, py + 7, "AQI", COLOR_MUTED, 1);
+    fb_draw_text_shadow(cx - text_width(aqi_text, 4) / 2, py + 24, aqi_text,
+                        aqi_col, glow, 4);
+    fb_draw_text5x7_centered(cx, py + 54, "INDEX", COLOR_MUTED, 1);
+  }
+
+  {
+    static const uint16_t kScaleColors[] = {
+        COLOR_GREEN, COLOR_LIME, COLOR_YELLOW, COLOR_ORANGE, COLOR_RED,
+    };
+    const int px = 66, py = 23, pw = 90, ph = 69;
+    const int cx = px + pw / 2;
+    draw_panel(px, py, pw, ph, aqi_col);
+    fb_draw_text5x7_shadow(cx - text5x7_width(aqi_lbl, 2) / 2, py + 8, aqi_lbl,
+                           aqi_col, glow, 2);
+    fb_draw_text5x7_centered(cx, py + 31, sensor_line, COLOR_WHITE, 1);
+    fb_draw_text5x7_centered(cx, py + 43, ens_status, COLOR_MUTED, 1);
+
+    const int seg_w = 13, seg_h = 6, seg_gap = 2;
+    int bar_total = 5 * seg_w + 4 * seg_gap;
+    int bar_x = cx - bar_total / 2;
+    int bar_y = py + ph - 10;
+    for (int s = 0; s < 5; s++) {
+      uint16_t sc = (s < state->aqi) ? kScaleColors[s] : RGB565(22, 34, 50);
+      fb_fill_rect(bar_x + s * (seg_w + seg_gap), bar_y, seg_w, seg_h, sc);
+    }
+
+    int active_index = clamp_int(state->aqi - 1, 0, 4);
+    int arrow_x = bar_x + active_index * (seg_w + seg_gap) + (seg_w / 2);
+    int arrow_y = bar_y - 1;
+    fb_fill_triangle(arrow_x, arrow_y, arrow_x - 2, arrow_y - 3, arrow_x + 2,
+                     arrow_y - 3, aqi_col);
+  }
+
+  draw_hybrid_metric_card(4, 52, "ECO2", eco2_text, "PPM", false,
+                          COLOR_YELLOW);
+  draw_hybrid_metric_card(60, 52, "TEMP", temp_text, "C", true, COLOR_YELLOW);
+  draw_hybrid_metric_card(116, 40, "HUMI", hum_text, "%", false, COLOR_CYAN);
+}
+
+static void draw_local_header(const char *title, const char *subtitle) {
+  fb_clear(COLOR_BG);
+  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+  fb_fill_rect(5, 5, 150, 18, RGB565(3, 10, 18));
+  fb_draw_rect(5, 5, 150, 18, RGB565(24, 78, 126));
+  fb_fill_rect(6, 6, 46, 2, COLOR_CYAN);
+  fb_draw_text5x7(10, 10, title, COLOR_WHITE, 1);
+  fb_draw_text5x7(10, 26, subtitle, COLOR_MUTED, 1);
+}
+
+static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status) {
+  char ssid_text[40];
+  char host_text[32];
+  char mode_text[16];
+  char link_text[16];
+
+  draw_local_header("WIFI CONFIG", "LOCAL PANEL");
+  sanitize_display_text(wifi_status->ssid, ssid_text, sizeof(ssid_text));
+  sanitize_display_text(CONNECTIVITY_RUNTIME_HOSTNAME ".LOCAL", host_text,
+                        sizeof(host_text));
+
+  strlcpy(mode_text,
+          wifi_status->provisioning_portal_active ? "PORTAL" : "RUNTIME",
+          sizeof(mode_text));
+  strlcpy(link_text, wifi_status->connected ? "ONLINE" : "OFFLINE",
+          sizeof(link_text));
+
+  draw_panel(6, 34, 148, 22, COLOR_CYAN);
+  fb_draw_text5x7(12, 40, "SSID", COLOR_MUTED, 1);
+  fb_draw_text5x7(58, 40, ssid_text, COLOR_WHITE, 1);
+
+  draw_panel(6, 60, 148, 22, COLOR_LIME);
+  fb_draw_text5x7(12, 66, "LINK", COLOR_MUTED, 1);
+  fb_draw_text5x7(58, 66, link_text,
+                  wifi_status->connected ? COLOR_LIME : COLOR_ORANGE, 1);
+  fb_draw_text5x7(102, 66, mode_text, COLOR_CYAN, 1);
+
+  draw_panel(6, 86, 148, 18, COLOR_YELLOW);
+  fb_draw_text5x7(12, 91, "HOST", COLOR_MUTED, 1);
+  fb_draw_text5x7(46, 91, host_text, COLOR_WHITE, 1);
+
+  draw_panel(6, 107, 148, 16, COLOR_ORANGE);
+  fb_draw_text5x7(12, 111, "IP", COLOR_MUTED, 1);
+  fb_draw_text5x7(34, 111, wifi_status->runtime_ip, COLOR_WHITE, 1);
+}
+
+static void draw_alarm_screen(void) {
+  draw_local_header("ALARM PANEL", "SAFE STUB");
+  draw_panel(6, 34, 148, 28, COLOR_ORANGE);
+  fb_draw_text5x7(12, 40, "ALARM 1", COLOR_MUTED, 1);
+  fb_draw_text5x7(88, 40, "06:30", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 50, "MODE DAILY", COLOR_CYAN, 1);
+  draw_panel(6, 67, 148, 24, COLOR_CYAN);
+  fb_draw_text5x7(12, 73, "ALARM 2", COLOR_MUTED, 1);
+  fb_draw_text5x7(88, 73, "21:00", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 82, "MODE IDLE", COLOR_MUTED, 1);
+  draw_panel(6, 96, 148, 27, COLOR_LIME);
+  fb_draw_text5x7(12, 102, "NEXT STEP", COLOR_MUTED, 1);
+  fb_draw_text5x7(12, 112, "SYNC WITH REAL RTC", COLOR_WHITE, 1);
+}
+
+static void draw_game_screen(void) {
+  draw_local_header("GAME HUB", "PLACEHOLDER");
+  draw_panel(6, 34, 148, 26, COLOR_CYAN);
+  fb_draw_text5x7(12, 40, "NEXT STEP", COLOR_MUTED, 1);
+  fb_draw_text5x7(78, 40, "MINI GAME", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 50, "SNAKE / TAP / REACT", COLOR_CYAN, 1);
+  draw_panel(6, 65, 148, 24, COLOR_ORANGE);
+  fb_draw_text5x7(12, 71, "INPUT", COLOR_MUTED, 1);
+  fb_draw_text5x7(60, 71, "USE BUTTON EVENT", COLOR_WHITE, 1);
+  draw_panel(6, 94, 148, 29, COLOR_LIME);
+  fb_draw_text5x7(12, 100, "STATUS", COLOR_MUTED, 1);
+  fb_draw_text5x7(12, 110, "RESERVED FOR GAME LOOP", COLOR_WHITE, 1);
+  fb_draw_text5x7(12, 118, "SAFE STUB FOR NOW", COLOR_CYAN, 1);
+}
+
+static void draw_memory_screen(void) {
+  if (memory_photo_service_snapshot(fb_data(), TFT_WIDTH * TFT_HEIGHT)) {
+    return;
+  }
+
+  draw_local_header("MEMORY VIEW", "UPLOAD PHOTO");
+  draw_panel(8, 35, 144, 40, COLOR_CYAN);
+  fb_draw_text5x7(16, 44, "NO MEMORY PHOTO", COLOR_WHITE, 1);
+  fb_draw_text5x7(16, 56, "OPEN WEB TAB TO", COLOR_MUTED, 1);
+  fb_draw_text5x7(16, 66, "LOAD RGB565 IMAGE", COLOR_CYAN, 1);
+  draw_panel(8, 82, 144, 38, COLOR_LIME);
+  fb_draw_text5x7(16, 91, "TIP", COLOR_MUTED, 1);
+  fb_draw_text5x7(16, 103, "WEB WILL SCALE IT", COLOR_WHITE, 1);
+  fb_draw_text5x7(16, 113, "TO 160X128 FOR YOU", COLOR_LIME, 1);
+}
+
+static void draw_menu_overlay(const local_menu_state_t *menu) {
+  static const char *kMenuItems[LOCAL_SCREEN_COUNT] = {
+      "MONITOR", "WIFI CONFIG", "ALARM", "GAME", "MEMORY"};
+  int highlight_y = menu->highlight_y_q8 >> 8;
+  int glow_y = highlight_y - 2;
+  int pulse = 6 + ((menu->pulse_phase >> 5) & 0x07);
+  int indicator_y = highlight_y + 5;
+
+  fb_clear(COLOR_BG);
+  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+  fb_draw_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(14, 44, 74));
+  fb_draw_rect(3, 3, TFT_WIDTH - 6, TFT_HEIGHT - 6, RGB565(8, 26, 42));
+  fb_fill_rect(12, 12, 54, 2, COLOR_CYAN);
+  fb_draw_text5x7(14, 20, "MAIN MENU", COLOR_WHITE, 2);
+  fb_fill_rect(16, glow_y, 128, 20, RGB565(2, 10, 18));
+  fb_fill_rect(17, highlight_y - 1, 126, 18, RGB565(3, 14, 24));
+  fb_fill_rect(18, highlight_y, 124, 16, RGB565(4, 18, 30));
+  fb_draw_rect(18, highlight_y, 124, 16, COLOR_CYAN);
+  fb_draw_rect(19, highlight_y + 1, 122, 14, RGB565(24, 130, 196));
+  fb_fill_rect(18, highlight_y, pulse, 16, COLOR_CYAN);
+  fb_fill_rect(28, indicator_y, 5, 5, COLOR_LIME);
+
+  for (int i = 0; i < LOCAL_SCREEN_COUNT; ++i) {
+    int row_y = 36 + (i * 18);
+    int distance = abs((row_y << 8) - menu->highlight_y_q8) >> 8;
+    int x_nudge = clamp_int((16 - distance) / 2, 0, 6);
+    uint16_t text_color = (distance <= 6) ? COLOR_WHITE : COLOR_MUTED;
+    fb_draw_text5x7(42 + x_nudge, row_y + 4, kMenuItems[i], text_color, 1);
+  }
+}
+
+void ui_renderer_draw_local_screen(const dashboard_state_t *state,
+                                   const local_menu_state_t *menu,
+                                   const connectivity_ui_status_t *wifi_status) {
+  switch (menu->active_screen) {
+  case LOCAL_SCREEN_MONITOR:
+    draw_hybrid_overlay(state, wifi_status->connected);
+    break;
+  case LOCAL_SCREEN_WIFI:
+    draw_wifi_screen(wifi_status);
+    break;
+  case LOCAL_SCREEN_ALARM:
+    draw_alarm_screen();
+    break;
+  case LOCAL_SCREEN_GAME:
+    draw_game_screen();
+    break;
+  case LOCAL_SCREEN_MEMORY:
+    draw_memory_screen();
+    break;
+  default:
+    draw_hybrid_overlay(state, wifi_status->connected);
+    break;
+  }
+
+  if (menu->visible) {
+    draw_menu_overlay(menu);
+  }
+}
+
+void ui_renderer_draw_boot_screen(int percent, const char *status) {
+  char percent_text[12];
+  const int shell_x = 6;
+  const int shell_y = 8;
+  const int shell_w = 148;
+  const int shell_h = 112;
+  const int shell_cx = shell_x + (shell_w / 2);
+  const int bar_x = 18;
+  const int bar_y = 92;
+  const int bar_w = 124;
+  const int bar_h = 9;
+  const int card_x = 15;
+  const int card_y = 60;
+  const int card_w = 128;
+  const int card_h = 28;
+  int fill_w;
+  uint16_t shell_border = RGB565(26, 72, 110);
+  uint16_t shell_glow = RGB565(10, 28, 48);
+  uint16_t accent = RGB565(70, 230, 255);
+  uint16_t accent_soft = RGB565(32, 110, 170);
+  uint16_t fill = RGB565(110, 245, 170);
+  uint16_t fill_glow = RGB565(42, 120, 96);
+  uint16_t dim = RGB565(118, 146, 176);
+
+  percent = clamp_int(percent, 0, 100);
+  fill_w = ((bar_w - 2) * percent) / 100;
+
+  fb_clear(COLOR_BG);
+  fb_fill_rect(4, 4, TFT_WIDTH - 8, TFT_HEIGHT - 8, RGB565(3, 8, 16));
+  fb_draw_rect(1, 1, TFT_WIDTH - 2, TFT_HEIGHT - 2, RGB565(9, 34, 54));
+  fb_draw_rect(4, 4, TFT_WIDTH - 8, TFT_HEIGHT - 8, RGB565(12, 48, 75));
+  fb_fill_rect(shell_x, shell_y, shell_w, shell_h, shell_glow);
+  fb_draw_rect(shell_x, shell_y, shell_w, shell_h, shell_border);
+  fb_draw_rect(shell_x + 2, shell_y + 2, shell_w - 4, shell_h - 4,
+               RGB565(9, 42, 68));
+  fb_fill_rect(shell_x + 10, shell_y + 8, 22, 2, accent);
+  fb_fill_rect(shell_x + 36, shell_y + 8, 8, 2, fill);
+  fb_fill_rect(shell_x + shell_w - 32, shell_y + 8, 22, 2, accent_soft);
+  fb_draw_text5x7_centered(shell_cx, 20, "AIR QUALITY NODE", dim, 1);
+  fb_draw_text5x7_shadow(shell_cx - text5x7_width("SYSTEM BOOT", 2) / 2, 33,
+                         "SYSTEM BOOT", COLOR_WHITE, RGB565(12, 36, 58), 2);
+  fb_fill_rect(shell_cx - 18, 53, 36, 2, accent_soft);
+  fb_fill_rect(shell_cx - 10, 53, 20, 2, accent);
+  fb_fill_rect(card_x, card_y, card_w, card_h, RGB565(6, 18, 30));
+  fb_draw_rect(card_x, card_y, card_w, card_h, accent_soft);
+  fb_fill_rect(card_x + 1, card_y + 1, card_w - 2, 2, accent);
+  fb_draw_text5x7(22, 66, "ACTIVE STAGE", COLOR_MUTED, 1);
+  fb_draw_text5x7_centered(card_x + (card_w / 2), 78, status, COLOR_CYAN, 1);
+  fb_fill_rect(bar_x, bar_y, bar_w, bar_h, RGB565(6, 16, 30));
+  fb_draw_rect(bar_x, bar_y, bar_w, bar_h, accent_soft);
+  if (fill_w > 0) {
+    fb_fill_rect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, fill_glow);
+    fb_fill_rect(bar_x + 1, bar_y + 1, fill_w, 2, fill);
+  }
+  snprintf(percent_text, sizeof(percent_text), "%3d%%", percent);
+  fb_draw_text5x7(18, 106, "SYNC PROGRESS", COLOR_MUTED, 1);
+  fb_draw_text5x7(shell_x + shell_w - 41, 106, percent_text, COLOR_WHITE, 1);
+}
+
+static void draw_aqi_scale_bar(int x, int y) {
+  const uint16_t colors[] = {
+      COLOR_GREEN,  COLOR_LIME,           COLOR_YELLOW,
+      COLOR_ORANGE, RGB565(255, 115, 60), COLOR_RED,
+  };
+
+  for (size_t i = 0; i < sizeof(colors) / sizeof(colors[0]); ++i) {
+    fb_fill_rect(x + (int)i * 10, y, 8, 6, colors[i]);
+  }
+}
+
+static void draw_aqi_gauge(const dashboard_state_t *state, int cx, int cy) {
+  const uint16_t palette[] = {
+      COLOR_GREEN,  COLOR_LIME_SOFT, COLOR_LIME,
+      COLOR_YELLOW, COLOR_ORANGE,    COLOR_RED,
+  };
+  int active_segments = clamp_int((state->aqi * 2) + 1, 1, 10);
+  const char *label = aqi_label(state->aqi);
+  char value_text[8];
+
+  for (int i = 0; i < 10; ++i) {
+    float start_deg = 145.0f + (float)i * 23.5f;
+    float end_deg = start_deg + 17.0f;
+    uint16_t color = (i < active_segments) ? palette[i / 2] : COLOR_OLIVE;
+    fb_draw_arc_segment(cx, cy, 18, 27, start_deg, end_deg, color);
+  }
+
+  fb_fill_circle(cx, cy, 16, COLOR_PANEL_ALT);
+  fb_draw_text(cx - text_width("AQI", 2) / 2, cy - 18, "AQI",
+               aqi_color(state->aqi), 2);
+  snprintf(value_text, sizeof(value_text), "%d", state->aqi);
+  fb_draw_text(cx - text_width(value_text, 5) / 2, cy - 2, value_text,
+               aqi_color(state->aqi), 5);
+  fb_draw_text(cx - text_width(label, 2) / 2, cy + 16, label,
+               aqi_color(state->aqi), 2);
+}
+
+void ui_renderer_draw_dashboard(const dashboard_state_t *state,
+                                bool wifi_connected) {
+  char time_text[16];
+  char date_text[16];
+  char co2_text[16];
+  char temp_text[16];
+  char hum_text[16];
+  const char *headline = aqi_label(state->aqi);
+  const char *sub1 = NULL;
+  const char *sub2 = NULL;
+  int headline_x;
+  int sub1_x;
+  int sub2_x;
+  const char *day_name[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+
+  snprintf(time_text, sizeof(time_text), "%02d:%02d:%02d", state->clock.tm_hour,
+           state->clock.tm_min, state->clock.tm_sec);
+  snprintf(date_text, sizeof(date_text), "%s %02d-%02d",
+           day_name[state->clock.tm_wday], state->clock.tm_mon + 1,
+           state->clock.tm_mday);
+  snprintf(co2_text, sizeof(co2_text), "%d", state->eco2_ppm);
+  snprintf(temp_text, sizeof(temp_text), "%d.%d", state->temp_tenths_c / 10,
+           abs(state->temp_tenths_c % 10));
+  snprintf(hum_text, sizeof(hum_text), "%d", state->humidity_pct);
+  aqi_subtext(state->aqi, &sub1, &sub2);
+  headline_x = 118 - text_width(headline, 3) / 2;
+  sub1_x = 118 - text_width(sub1, 2) / 2;
+  sub2_x = 118 - text_width(sub2, 2) / 2;
+
+  draw_starry_background();
+  draw_panel(5, 5, 150, 27, COLOR_CYAN);
+  draw_panel(5, 36, 72, 58, aqi_color(state->aqi));
+  draw_panel(82, 36, 73, 58, COLOR_LIME);
+  fb_draw_text(10, 9, time_text, COLOR_WHITE, 3);
+  fb_draw_text(10, 21, date_text, COLOR_MUTED, 2);
+  if (wifi_connected) {
+    draw_wifi_icon(141, 11, COLOR_LIME);
+  } else {
+    draw_wifi_offline_icon(141, 11, COLOR_MUTED, COLOR_RED);
+  }
+  draw_aqi_gauge(state, 41, 66);
+  fb_draw_text(headline_x, 44, headline, aqi_color(state->aqi), 3);
+  fb_draw_text(sub1_x, 63, sub1, COLOR_WHITE, 2);
+  fb_draw_text(sub2_x, 74, sub2, COLOR_MUTED, 2);
+  draw_aqi_scale_bar(89, 85);
+  draw_panel(5, 99, 46, 24, COLOR_LIME);
+  draw_panel(57, 99, 46, 24, COLOR_LIME_SOFT);
+  draw_panel(109, 99, 46, 24, COLOR_CYAN);
+  fb_draw_text(13, 104, "CO2", COLOR_MUTED, 1);
+  fb_draw_text(65, 104, "TEMP", COLOR_MUTED, 1);
+  fb_draw_text(118, 104, "HUM", COLOR_MUTED, 1);
+  fb_draw_text(12, 111, co2_text, COLOR_YELLOW, 2);
+  fb_draw_text(61, 111, temp_text, COLOR_YELLOW, 2);
+  fb_draw_text(119, 111, hum_text, COLOR_CYAN, 2);
+}
