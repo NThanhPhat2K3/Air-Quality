@@ -897,11 +897,13 @@ static void draw_local_header(const char *title, const char *subtitle) {
 static void draw_wifi_action_menu(const local_menu_state_t *menu,
                                   const connectivity_ui_status_t *wifi_status) {
   static const char *kActions[] = {
-      "OPEN PORTAL", "DISCONNECT", "STOP PORTAL", "FORGET WIFI", "HOME"};
+      "OPEN PORTAL", "SAVED WIFI", "DISCONNECT", "STOP PORTAL", "FORGET WIFI",
+      "HOME"};
+  const int action_count = (int)(sizeof(kActions) / sizeof(kActions[0]));
   int panel_x = 14;
   int panel_y = 30;
   int panel_w = 132;
-  int panel_h = 82;
+  int panel_h = 93;
   uint16_t accent = wifi_status->provisioning_portal_active
                         ? COLOR_CYAN
                         : (wifi_status->connected ? COLOR_LIME : COLOR_ORANGE);
@@ -917,7 +919,7 @@ static void draw_wifi_action_menu(const local_menu_state_t *menu,
   fb_fill_rect(panel_x + 8, panel_y + 8, 40, 2, accent);
   fb_draw_text5x7(panel_x + 10, panel_y + 14, "WIFI ACTIONS", COLOR_WHITE, 1);
 
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < action_count; ++i) {
     int row_y = panel_y + 24 + (i * 11);
     bool selected = (i == menu->wifi_action_selected);
     if (selected) {
@@ -930,12 +932,70 @@ static void draw_wifi_action_menu(const local_menu_state_t *menu,
   }
 }
 
+static void draw_wifi_saved_menu(const local_menu_state_t *menu,
+                                 const connectivity_ui_status_t *wifi_status) {
+  connectivity_saved_network_t saved[CONNECTIVITY_SAVED_NETWORKS_MAX] = {0};
+  size_t saved_count =
+      connectivity_service_get_saved_networks(saved, CONNECTIVITY_SAVED_NETWORKS_MAX);
+  int panel_x = 18;
+  int panel_y = 26;
+  int panel_w = 124;
+  int panel_h = 86;
+  uint16_t accent = wifi_status->provisioning_portal_active
+                        ? COLOR_CYAN
+                        : (wifi_status->connected ? COLOR_LIME : COLOR_ORANGE);
+  int item_count = (int)saved_count + 1;
+
+  if (!menu->wifi_actions_visible || !menu->wifi_saved_visible) {
+    return;
+  }
+
+  fb_fill_rect(panel_x, panel_y, panel_w, panel_h, RGB565(4, 10, 18));
+  fb_draw_rect(panel_x, panel_y, panel_w, panel_h, RGB565(28, 74, 116));
+  fb_draw_rect(panel_x + 2, panel_y + 2, panel_w - 4, panel_h - 4,
+               RGB565(8, 26, 42));
+  fb_fill_rect(panel_x + 8, panel_y + 8, 34, 2, accent);
+  fb_draw_text5x7(panel_x + 10, panel_y + 14, "SAVED WIFI", COLOR_WHITE, 1);
+
+  if (saved_count == 0) {
+    fb_draw_text5x7(panel_x + 10, panel_y + 34, "NO SAVED LIST", COLOR_MUTED, 1);
+  }
+
+  for (int i = 0; i < item_count; ++i) {
+    char row_text[24];
+    int row_y = panel_y + 24 + (i * 10);
+    bool selected = (i == menu->wifi_saved_selected);
+
+    if (selected) {
+      fb_fill_rect(panel_x + 8, row_y - 1, panel_w - 16, 9, RGB565(8, 24, 38));
+      fb_draw_rect(panel_x + 8, row_y - 1, panel_w - 16, 9, accent);
+      fb_fill_rect(panel_x + 10, row_y + 2, 3, 3, accent);
+    }
+
+    if (i < (int)saved_count) {
+      char row_short[24];
+      sanitize_display_text(saved[i].ssid, row_text, sizeof(row_text));
+      truncate_text_to_width(row_text, row_short, sizeof(row_short), 88, 1);
+      fb_draw_text5x7(panel_x + 18, row_y, row_short,
+                      selected ? COLOR_WHITE : COLOR_MUTED, 1);
+      if (saved[i].active) {
+        fb_draw_text5x7(panel_x + 94, row_y, "ON",
+                        selected ? accent : COLOR_CYAN, 1);
+      }
+    } else {
+      fb_draw_text5x7(panel_x + 18, row_y, "BACK",
+                      selected ? COLOR_WHITE : COLOR_MUTED, 1);
+    }
+  }
+}
+
 static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
                              const local_menu_state_t *menu) {
   char ssid_text[40];
   char ip_text[20];
   char ssid_short[40];
   char url_text[48];
+  const char *notice_text = NULL;
   const bool portal_active = wifi_status->provisioning_portal_active;
   const bool can_open_qr = portal_active || wifi_status->connected;
   const uint16_t accent = portal_active
@@ -947,6 +1007,21 @@ static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
   fb_draw_rect(104, 8, 44, 10, accent);
   fb_fill_circle(109, 13, 1, accent);
   fb_draw_text(114, 11, portal_active ? "PORTAL" : "RUNTIME", accent, 1);
+
+  if (menu->wifi_notice_kind == 1) {
+    notice_text = "SAVED WIFI OK";
+  } else if (menu->wifi_notice_kind == 2) {
+    notice_text = "SAVED WIFI FAIL";
+  }
+  if (notice_text != NULL) {
+    int notice_w = text_width(notice_text, 1) + 12;
+    int notice_x = (TFT_WIDTH - notice_w) / 2;
+    uint16_t notice_color = menu->wifi_notice_kind == 1 ? COLOR_LIME : COLOR_ORANGE;
+    fb_fill_rect(notice_x, 22, notice_w, 10, RGB565(8, 18, 28));
+    fb_draw_rect(notice_x, 22, notice_w, 10, notice_color);
+    fb_draw_text(notice_x + 6, 24, notice_text, notice_color, 1);
+  }
+
   sanitize_display_text(wifi_status->ssid, ssid_text, sizeof(ssid_text));
   sanitize_display_text(wifi_status->runtime_ip, ip_text, sizeof(ip_text));
   truncate_text_to_width(ssid_text, ssid_short, sizeof(ssid_short), 148, 4);
@@ -963,6 +1038,7 @@ static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
 
   fb_draw_text5x7_centered(80, 121, ssid_short, RGB565(230, 238, 246), 1);
   draw_wifi_action_menu(menu, wifi_status);
+  draw_wifi_saved_menu(menu, wifi_status);
 }
 
 static void draw_alarm_editor(const local_menu_state_t *menu) {

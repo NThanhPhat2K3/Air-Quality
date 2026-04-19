@@ -59,9 +59,10 @@
 #define WIFI_FLASH_WRITE_COOLDOWN_MS (30 * 1000)
 #define WIFI_SCAN_MAX_RESULTS 24
 #define WIFI_SCAN_JSON_MAX_LEN 4096
-#define WIFI_STATE_JSON_MAX_LEN 1024
+#define WIFI_STATE_JSON_MAX_LEN 2048
 #define WIFI_CONNECT_FAIL_PORTAL_THRESHOLD 1
 #define WIFI_TARGET_MISSING_PORTAL_THRESHOLD 2
+#define WIFI_HISTORY_MAX_ITEMS 5
 #define MEMORY_PHOTO_JSON_MAX_LEN 256
 #define RUNTIME_MDNS_INSTANCE "AQ Node"
 #define WIFI_TEST_CONNECT_TIMEOUT_MS 15000
@@ -75,6 +76,13 @@ typedef struct {
   bool valid;
   bool from_nvs;
 } wifi_credentials_t;
+
+typedef struct {
+  char ssid[33];
+  char password[65];
+  bool hidden;
+  bool valid;
+} wifi_history_entry_t;
 
 typedef enum {
   WIFI_TARGET_SCAN_FOUND = 0,
@@ -116,6 +124,8 @@ static int64_t s_last_credentials_write_us;
 static _Atomic int s_wifi_connect_fail_cycles;
 static _Atomic int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
+static bool s_wifi_history_loaded;
+static wifi_history_entry_t s_wifi_history[WIFI_HISTORY_MAX_ITEMS];
 static char s_provisioning_ap_ssid[33];
 static portMUX_TYPE s_connectivity_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -136,6 +146,7 @@ typedef enum {
 
 static void schedule_clock_sync_retry(uint32_t delay_ms);
 static void wifi_refresh_credentials_cache(void);
+static void wifi_refresh_history_cache(void);
 static void wifi_clear_status_bits(void);
 static bool start_provisioning_portal(void);
 static bool stop_provisioning_portal(void);
@@ -163,6 +174,222 @@ static bool is_placeholder_credentials(const char *ssid, const char *password) {
   if (password != NULL && strcmp(password, "YOUR_WIFI_PASSWORD") == 0) {
     return true;
   }
+  return false;
+}
+
+static void wifi_history_make_key(char *out, size_t out_len, const char *prefix,
+                                  int index) {
+  if (out == NULL || out_len == 0 || prefix == NULL) {
+    return;
+  }
+  snprintf(out, out_len, "%s%d", prefix, index);
+}
+
+static void wifi_history_clear_cache(void) {
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  memset(s_wifi_history, 0, sizeof(s_wifi_history));
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+}
+
+static void wifi_history_copy_snapshot(wifi_history_entry_t *out,
+                                       size_t out_len, size_t *out_count) {
+  size_t count = 0;
+
+  if (out != NULL && out_len > 0) {
+    memset(out, 0, sizeof(*out) * out_len);
+  }
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  for (size_t i = 0; i < WIFI_HISTORY_MAX_ITEMS; ++i) {
+    if (!s_wifi_history[i].valid) {
+      continue;
+    }
+    if (out != NULL && count < out_len) {
+      out[count] = s_wifi_history[i];
+    }
+    count++;
+  }
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+
+  if (out_count != NULL) {
+    *out_count = count;
+  }
+}
+
+static bool wifi_load_history_from_nvs(void) {
+  nvs_handle_t nvs_handle;
+  esp_err_t ret =
+      nvs_open(WIFI_CREDENTIALS_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if (ret != ESP_OK) {
+    return false;
+  }
+
+  wifi_history_entry_t loaded[WIFI_HISTORY_MAX_ITEMS] = {0};
+
+  for (size_t i = 0; i < WIFI_HISTORY_MAX_ITEMS; ++i) {
+    char ssid_key[12];
+    char pass_key[12];
+    char hidden_key[12];
+    uint8_t hidden = 0;
+    size_t ssid_len = sizeof(loaded[i].ssid);
+    size_t pass_len = sizeof(loaded[i].password);
+
+    wifi_history_make_key(ssid_key, sizeof(ssid_key), "hssid", (int)i);
+    wifi_history_make_key(pass_key, sizeof(pass_key), "hpass", (int)i);
+    wifi_history_make_key(hidden_key, sizeof(hidden_key), "hhid", (int)i);
+
+    ret = nvs_get_str(nvs_handle, ssid_key, loaded[i].ssid, &ssid_len);
+    if (ret != ESP_OK || loaded[i].ssid[0] == '\0') {
+      memset(&loaded[i], 0, sizeof(loaded[i]));
+      continue;
+    }
+
+    ret = nvs_get_str(nvs_handle, pass_key, loaded[i].password, &pass_len);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+      loaded[i].password[0] = '\0';
+    } else if (ret != ESP_OK) {
+      memset(&loaded[i], 0, sizeof(loaded[i]));
+      continue;
+    }
+
+    ret = nvs_get_u8(nvs_handle, hidden_key, &hidden);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+      hidden = 0;
+    } else if (ret != ESP_OK) {
+      memset(&loaded[i], 0, sizeof(loaded[i]));
+      continue;
+    }
+
+    loaded[i].hidden = hidden != 0;
+    loaded[i].valid = true;
+  }
+
+  nvs_close(nvs_handle);
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  memcpy(s_wifi_history, loaded, sizeof(s_wifi_history));
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+  return true;
+}
+
+static void wifi_refresh_history_cache(void) {
+  if (s_wifi_history_loaded) {
+    return;
+  }
+
+  if (!wifi_load_history_from_nvs()) {
+    wifi_history_clear_cache();
+  }
+  s_wifi_history_loaded = true;
+}
+
+static void wifi_history_note_credentials_in_cache(const char *ssid,
+                                                   const char *password,
+                                                   bool hidden) {
+  wifi_history_entry_t updated[WIFI_HISTORY_MAX_ITEMS] = {0};
+  size_t write_index = 1;
+  const char *safe_password = password != NULL ? password : "";
+
+  if (ssid == NULL || ssid[0] == '\0') {
+    return;
+  }
+
+  strlcpy(updated[0].ssid, ssid, sizeof(updated[0].ssid));
+  strlcpy(updated[0].password, safe_password, sizeof(updated[0].password));
+  updated[0].hidden = hidden;
+  updated[0].valid = true;
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  for (size_t i = 0; i < WIFI_HISTORY_MAX_ITEMS && write_index < WIFI_HISTORY_MAX_ITEMS;
+       ++i) {
+    if (!s_wifi_history[i].valid) {
+      continue;
+    }
+    if (strcmp(s_wifi_history[i].ssid, ssid) == 0) {
+      continue;
+    }
+    updated[write_index++] = s_wifi_history[i];
+  }
+  memcpy(s_wifi_history, updated, sizeof(s_wifi_history));
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+}
+
+static esp_err_t wifi_history_write_nvs(nvs_handle_t nvs_handle) {
+  wifi_history_entry_t snapshot[WIFI_HISTORY_MAX_ITEMS] = {0};
+  size_t count = 0;
+
+  wifi_history_copy_snapshot(snapshot, WIFI_HISTORY_MAX_ITEMS, &count);
+
+  for (size_t i = 0; i < WIFI_HISTORY_MAX_ITEMS; ++i) {
+    char ssid_key[12];
+    char pass_key[12];
+    char hidden_key[12];
+    esp_err_t ret;
+
+    wifi_history_make_key(ssid_key, sizeof(ssid_key), "hssid", (int)i);
+    wifi_history_make_key(pass_key, sizeof(pass_key), "hpass", (int)i);
+    wifi_history_make_key(hidden_key, sizeof(hidden_key), "hhid", (int)i);
+
+    if (i < count && snapshot[i].valid) {
+      ret = nvs_set_str(nvs_handle, ssid_key, snapshot[i].ssid);
+      if (ret != ESP_OK) {
+        return ret;
+      }
+      ret = nvs_set_str(nvs_handle, pass_key, snapshot[i].password);
+      if (ret != ESP_OK) {
+        return ret;
+      }
+      ret = nvs_set_u8(nvs_handle, hidden_key, snapshot[i].hidden ? 1 : 0);
+      if (ret != ESP_OK) {
+        return ret;
+      }
+      continue;
+    }
+
+    nvs_erase_key(nvs_handle, ssid_key);
+    nvs_erase_key(nvs_handle, pass_key);
+    nvs_erase_key(nvs_handle, hidden_key);
+  }
+
+  return ESP_OK;
+}
+
+static bool wifi_history_get_entry_by_slot(int slot, wifi_history_entry_t *out) {
+  if (slot < 0 || slot >= WIFI_HISTORY_MAX_ITEMS || out == NULL) {
+    return false;
+  }
+
+  wifi_refresh_history_cache();
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  *out = s_wifi_history[slot];
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+  return out->valid;
+}
+
+static bool wifi_history_get_entry_by_compact_index(size_t index,
+                                                    wifi_history_entry_t *out) {
+  size_t compact_index = 0;
+
+  if (out == NULL) {
+    return false;
+  }
+
+  wifi_refresh_history_cache();
+
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  for (size_t i = 0; i < WIFI_HISTORY_MAX_ITEMS; ++i) {
+    if (!s_wifi_history[i].valid) {
+      continue;
+    }
+    if (compact_index == index) {
+      *out = s_wifi_history[i];
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      return true;
+    }
+    compact_index++;
+  }
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
   return false;
 }
 
@@ -287,6 +514,11 @@ static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
     ret = nvs_set_u8(nvs_handle, WIFI_CREDENTIALS_KEY_HIDDEN, hidden ? 1 : 0);
   }
   if (ret == ESP_OK) {
+    wifi_refresh_history_cache();
+    wifi_history_note_credentials_in_cache(ssid, safe_password, hidden);
+    ret = wifi_history_write_nvs(nvs_handle);
+  }
+  if (ret == ESP_OK) {
     ret = nvs_commit(nvs_handle);
   }
   nvs_close(nvs_handle);
@@ -295,6 +527,7 @@ static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
     s_last_credentials_write_us = now_us;
     wifi_set_credentials_cache(ssid, safe_password, hidden, true);
     s_wifi_credentials_loaded = true;
+    s_wifi_history_loaded = true;
     s_provisioning_portal_active = false;
     if (did_write != NULL) {
       *did_write = true;
@@ -341,7 +574,9 @@ static esp_err_t wifi_erase_credentials_nvs(void) {
 
   if (ret == ESP_OK) {
     wifi_set_credentials_cache("", "", false, false);
+    wifi_history_clear_cache();
     s_wifi_credentials_loaded = false;
+    s_wifi_history_loaded = false;
     ESP_LOGI(TAG, "Wi-Fi credentials erased from NVS");
   }
   return ret;
@@ -860,8 +1095,11 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
   char runtime_ip[20] = "";
   char ap_ip[20] = "";
   char escaped_access_url[96];
-  char payload[WIFI_STATE_JSON_MAX_LEN];
+  char *history_json = NULL;
+  char *payload = NULL;
   wifi_credentials_t creds_snap;
+  wifi_history_entry_t history[WIFI_HISTORY_MAX_ITEMS] = {0};
+  size_t history_count = 0;
   bool portal_snap;
   const char *access_ip = NULL;
   char access_url[80] = "";
@@ -874,6 +1112,8 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
   json_escape(creds_snap.valid ? creds_snap.ssid : "",
               escaped_ssid, sizeof(escaped_ssid));
   json_escape(s_provisioning_ap_ssid, escaped_ap_ssid, sizeof(escaped_ap_ssid));
+  wifi_refresh_history_cache();
+  wifi_history_copy_snapshot(history, WIFI_HISTORY_MAX_ITEMS, &history_count);
 
   get_netif_ip_string(s_wifi_sta_netif, runtime_ip, sizeof(runtime_ip));
   get_netif_ip_string(s_wifi_ap_netif, ap_ip, sizeof(ap_ip));
@@ -887,13 +1127,66 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
   }
   json_escape(access_url, escaped_access_url, sizeof(escaped_access_url));
 
-  snprintf(payload, sizeof(payload),
+  history_json = calloc(1, 768);
+  payload = calloc(1, WIFI_STATE_JSON_MAX_LEN);
+  if (history_json == NULL || payload == NULL) {
+    free(history_json);
+    free(payload);
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Out of memory");
+  }
+
+  int history_written =
+      snprintf(history_json, 768, "[");
+  if (history_written < 0 || (size_t)history_written >= 768) {
+    free(history_json);
+    free(payload);
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "History payload overflow");
+  }
+
+  for (size_t i = 0; i < history_count && i < WIFI_HISTORY_MAX_ITEMS; ++i) {
+    char escaped_history_ssid[160];
+    int append;
+    bool active = creds_snap.valid &&
+                  strcmp(history[i].ssid, creds_snap.ssid) == 0 &&
+                  history[i].hidden == creds_snap.hidden;
+
+    json_escape(history[i].ssid, escaped_history_ssid,
+                sizeof(escaped_history_ssid));
+    append = snprintf(history_json + history_written,
+                      768 - (size_t)history_written,
+                      "%s{\"slot\":%u,\"ssid\":\"%s\",\"hidden\":%s,"
+                      "\"active\":%s}",
+                      i > 0 ? "," : "", (unsigned)i, escaped_history_ssid,
+                      history[i].hidden ? "true" : "false",
+                      active ? "true" : "false");
+    if (append < 0 || (size_t)append >= 768 - (size_t)history_written) {
+      free(history_json);
+      free(payload);
+      return send_json_message(req, "500 Internal Server Error", false,
+                               "History payload overflow");
+    }
+    history_written += append;
+  }
+
+  if ((size_t)history_written + 1 >= 768) {
+    free(history_json);
+    free(payload);
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "History payload overflow");
+  }
+  history_json[history_written++] = ']';
+  history_json[history_written] = '\0';
+
+  snprintf(payload, WIFI_STATE_JSON_MAX_LEN,
            "{\"ok\":true,\"mode\":\"%s\",\"connected\":%s,"
            "\"provisioning\":%s,\"credentialSource\":\"%s\","
            "\"currentSsid\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
            "\"hiddenSsid\":%s,\"canStartPortal\":%s,\"runtimeIp\":\"%s\","
            "\"runtimeHost\":\"%s.local\",\"apIp\":\"%s\","
-           "\"accessIp\":\"%s\",\"accessUrl\":\"%s\"}",
+           "\"accessIp\":\"%s\",\"accessUrl\":\"%s\","
+           "\"savedNetworks\":%s}",
            portal_snap ? "provisioning" : "runtime",
            connectivity_service_is_wifi_connected() ? "true" : "false",
            portal_snap ? "true" : "false",
@@ -903,9 +1196,13 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
            escaped_ssid, escaped_ap_ssid, WIFI_PROVISIONING_AP_PASS,
            creds_snap.hidden ? "true" : "false",
            creds_snap.valid ? "true" : "false", runtime_ip,
-           CONNECTIVITY_RUNTIME_HOSTNAME, ap_ip, access_ip, escaped_access_url);
+           CONNECTIVITY_RUNTIME_HOSTNAME, ap_ip, access_ip,
+           escaped_access_url, history_json);
 
-  return send_json_response(req, "200 OK", payload);
+  esp_err_t ret = send_json_response(req, "200 OK", payload);
+  free(history_json);
+  free(payload);
+  return ret;
 }
 
 static esp_err_t config_telemetry_get_handler(httpd_req_t *req) {
@@ -1248,6 +1545,85 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
                            "Connected! Credentials saved. Device restarting.");
 }
 
+static esp_err_t config_wifi_history_use_post_handler(httpd_req_t *req) {
+  char body[WIFI_PROVISIONING_BODY_MAX_LEN] = {0};
+  char slot_value[8] = {0};
+  wifi_history_entry_t entry = {0};
+  char *end_ptr = NULL;
+  long slot = 0;
+
+  if (!read_http_body(req, body, sizeof(body))) {
+    return send_json_message(req, "400 Bad Request", false, "Invalid body");
+  }
+
+  if (!form_get_value(body, "slot", slot_value, sizeof(slot_value))) {
+    return send_json_message(req, "400 Bad Request", false,
+                             "Missing saved Wi-Fi slot");
+  }
+
+  slot = strtol(slot_value, &end_ptr, 10);
+  if (end_ptr == slot_value || *end_ptr != '\0' || slot < 0 ||
+      slot >= WIFI_HISTORY_MAX_ITEMS) {
+    return send_json_message(req, "400 Bad Request", false,
+                             "Saved Wi-Fi slot invalid");
+  }
+
+  if (!wifi_history_get_entry_by_slot((int)slot, &entry)) {
+    return send_json_message(req, "404 Not Found", false,
+                             "Saved Wi-Fi entry not found");
+  }
+
+  wifi_test_result_t test =
+      wifi_test_credentials(entry.ssid, entry.password, entry.hidden);
+  if (test != WIFI_TEST_RESULT_CONNECTED) {
+    const char *reason = "Saved Wi-Fi could not connect. Please enter it again.";
+    if (test == WIFI_TEST_RESULT_NOT_FOUND) {
+      reason = "Saved Wi-Fi is not visible right now. Move closer and try again.";
+    } else if (test == WIFI_TEST_RESULT_WRONG_PASSWORD) {
+      reason =
+          "Saved Wi-Fi password no longer works. Please update the password.";
+    } else if (test == WIFI_TEST_RESULT_TIMEOUT) {
+      reason = "Saved Wi-Fi timed out. Please try again in a moment.";
+    }
+    ESP_LOGW(TAG, "Saved Wi-Fi test failed for SSID '%s': %s", entry.ssid,
+             reason);
+    return send_json_message(req, "422 Unprocessable Entity", false, reason);
+  }
+
+  bool did_write = false;
+  esp_err_t ret = wifi_save_credentials_to_nvs(entry.ssid, entry.password,
+                                               entry.hidden, &did_write);
+  if (ret == ESP_ERR_INVALID_STATE) {
+    return send_json_message(req, "429 Too Many Requests", false,
+                             "Please wait a bit before switching Wi-Fi again");
+  }
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Saving Wi-Fi history selection failed: %s",
+             esp_err_to_name(ret));
+    return send_json_message(req, "500 Internal Server Error", false,
+                             "Failed to switch to saved Wi-Fi");
+  }
+
+  if (!did_write) {
+    if (s_provisioning_portal_active) {
+      if (!stop_provisioning_portal()) {
+        return send_json_message(req, "500 Internal Server Error", false,
+                                 "Connected, but failed to close setup hotspot");
+      }
+      return send_json_message(req, "200 OK", true,
+                               "Connected with saved Wi-Fi. Setup hotspot closed.");
+    }
+    return send_json_message(req, "200 OK", true,
+                             "Connected with saved Wi-Fi.");
+  }
+
+  ESP_LOGI(TAG, "Saved Wi-Fi selected and verified (ssid=%s). Restarting...",
+           entry.ssid);
+  schedule_delayed_restart();
+  return send_json_message(req, "200 OK", true,
+                           "Saved Wi-Fi selected. Device restarting.");
+}
+
 static esp_err_t config_provisioning_start_post_handler(httpd_req_t *req) {
   s_provisioning_auto_opened = false;
   if (!wifi_credentials_configured()) {
@@ -1374,6 +1750,9 @@ static bool start_config_http_server(void) {
        .method = HTTP_POST,
        .handler = config_wifi_post_handler},
       {.uri = "/wifi", .method = HTTP_POST, .handler = config_wifi_post_handler},
+      {.uri = "/api/wifi/history/use",
+       .method = HTTP_POST,
+       .handler = config_wifi_history_use_post_handler},
       {.uri = "/api/provisioning/start",
        .method = HTTP_POST,
        .handler = config_provisioning_start_post_handler},
@@ -2249,6 +2628,70 @@ bool connectivity_service_forget_credentials(void) {
     return false;
   }
   return start_provisioning_portal();
+}
+
+size_t connectivity_service_get_saved_networks(connectivity_saved_network_t *out,
+                                              size_t max_items) {
+  wifi_history_entry_t history[WIFI_HISTORY_MAX_ITEMS] = {0};
+  wifi_credentials_t current = wifi_credentials_snapshot();
+  size_t history_count = 0;
+  size_t count = 0;
+
+  wifi_refresh_history_cache();
+  wifi_history_copy_snapshot(history, WIFI_HISTORY_MAX_ITEMS, &history_count);
+
+  if (out != NULL && max_items > 0) {
+    memset(out, 0, sizeof(*out) * max_items);
+  }
+
+  for (size_t i = 0; i < history_count; ++i) {
+    if (out != NULL && count < max_items) {
+      strlcpy(out[count].ssid, history[i].ssid, sizeof(out[count].ssid));
+      out[count].hidden = history[i].hidden;
+      out[count].active = current.valid &&
+                          strcmp(history[i].ssid, current.ssid) == 0 &&
+                          history[i].hidden == current.hidden;
+    }
+    count++;
+  }
+
+  return count;
+}
+
+bool connectivity_service_use_saved_network_index(size_t index) {
+  wifi_history_entry_t entry = {0};
+  bool did_write = false;
+  esp_err_t ret;
+  wifi_test_result_t test;
+
+  if (!wifi_history_get_entry_by_compact_index(index, &entry)) {
+    return false;
+  }
+
+  test = wifi_test_credentials(entry.ssid, entry.password, entry.hidden);
+  if (test != WIFI_TEST_RESULT_CONNECTED) {
+    ESP_LOGW(TAG, "Local saved Wi-Fi connect failed for SSID '%s' (reason=%d)",
+             entry.ssid, (int)test);
+    return false;
+  }
+
+  ret = wifi_save_credentials_to_nvs(entry.ssid, entry.password, entry.hidden,
+                                     &did_write);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Local saved Wi-Fi save failed for SSID '%s': %s",
+             entry.ssid, esp_err_to_name(ret));
+    return false;
+  }
+
+  if (!did_write) {
+    if (s_provisioning_portal_active) {
+      return stop_provisioning_portal();
+    }
+    return true;
+  }
+
+  schedule_delayed_restart();
+  return true;
 }
 
 void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {

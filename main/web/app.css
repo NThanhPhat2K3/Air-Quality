@@ -836,6 +836,80 @@ h3 {
   border-color: var(--accent);
 }
 
+.saved-wifi-list {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.saved-wifi-status {
+  min-height: 1.15rem;
+  margin-top: 8px;
+}
+
+.saved-wifi-empty {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px dashed rgba(116, 179, 220, 0.22);
+  background: rgba(8, 20, 33, 0.58);
+}
+
+.saved-wifi-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(106, 165, 208, 0.28);
+  background: linear-gradient(180deg, rgba(10, 26, 42, 0.92), rgba(7, 19, 32, 0.92));
+}
+
+.saved-wifi-main {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.saved-wifi-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.saved-wifi-ssid {
+  font-size: 0.96rem;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.saved-wifi-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.saved-wifi-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 9px;
+  border: 1px solid rgba(116, 186, 230, 0.22);
+  background: rgba(9, 24, 39, 0.76);
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.saved-wifi-chip.active {
+  border-color: rgba(88, 242, 190, 0.34);
+  color: var(--accent-2);
+}
+
+.saved-wifi-action {
+  white-space: nowrap;
+}
+
 .scan-main {
   display: flex;
   flex-direction: column;

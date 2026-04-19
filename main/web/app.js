@@ -22,6 +22,8 @@ const metricTemp = document.getElementById("metricTemp");
 const metricHumidity = document.getElementById("metricHumidity");
 
 const scanList = document.getElementById("scanList");
+const savedWifiList = document.getElementById("savedWifiList");
+const savedWifiStatus = document.getElementById("savedWifiStatus");
 const scanBtn = document.getElementById("scanBtn");
 const enablePortalBtn = document.getElementById("enablePortalBtn");
 const wifiForm = document.getElementById("wifiForm");
@@ -105,6 +107,8 @@ const TEXT = {
     "wifi.meta.current": "Current Wi-Fi",
     "wifi.meta.hotspot": "Setup hotspot",
     "wifi.meta.saved": "Saved settings",
+    "wifi.saved.title": "Previously Used Wi-Fi",
+    "wifi.saved.hint": "Tap one saved network to reconnect without typing the password again.",
     "wifi.scan.title": "Choose a Wi-Fi network",
     "wifi.scan.portal": "Open Setup Hotspot",
     "wifi.scan.find": "Find Wi-Fi",
@@ -159,6 +163,13 @@ const TEXT = {
     "status.secure": "Secure",
     "status.open": "Open",
     "status.selectedWifi": "Selected Wi-Fi: {ssid}",
+    "status.savedWifiEmpty": "Once the device connects successfully, the most recent Wi-Fi networks will appear here.",
+    "status.savedWifiUse": "Use Again",
+    "status.savedWifiCurrent": "Current choice",
+    "status.savedWifiHidden": "Hidden network",
+    "status.savedWifiReady": "Saved on device",
+    "status.savedWifiConnecting": "Trying saved Wi-Fi: {ssid}...",
+    "status.savedWifiSelected": "Trying saved Wi-Fi now.",
     "status.scanning": "Looking for nearby Wi-Fi networks...",
     "status.scanFound": "Found {count} Wi-Fi networks.",
     "status.enterWifiName": "Please enter the Wi-Fi name.",
@@ -217,6 +228,8 @@ const TEXT = {
     "wifi.meta.current": "Wi‑Fi hiện tại",
     "wifi.meta.hotspot": "Hotspot cài đặt",
     "wifi.meta.saved": "Thiết lập đã lưu",
+    "wifi.saved.title": "Wi‑Fi đã từng dùng",
+    "wifi.saved.hint": "Chạm một mạng đã lưu để kết nối lại mà không cần nhập mật khẩu nữa.",
     "wifi.scan.title": "Chọn một mạng Wi‑Fi",
     "wifi.scan.portal": "Mở Hotspot Cài Đặt",
     "wifi.scan.find": "Tìm Wi‑Fi",
@@ -271,6 +284,13 @@ const TEXT = {
     "status.secure": "Có khóa",
     "status.open": "Mở",
     "status.selectedWifi": "Đã chọn Wi‑Fi: {ssid}",
+    "status.savedWifiEmpty": "Sau khi thiết bị kết nối thành công, các mạng gần đây sẽ hiện ở đây để chọn lại nhanh.",
+    "status.savedWifiUse": "Dùng lại",
+    "status.savedWifiCurrent": "Đang dùng",
+    "status.savedWifiHidden": "Mạng ẩn",
+    "status.savedWifiReady": "Đã lưu trên thiết bị",
+    "status.savedWifiConnecting": "Đang thử Wi‑Fi đã lưu: {ssid}...",
+    "status.savedWifiSelected": "Đang thử Wi‑Fi đã lưu.",
     "status.scanning": "Đang tìm các mạng Wi‑Fi gần đây...",
     "status.scanFound": "Đã tìm thấy {count} mạng Wi‑Fi.",
     "status.enterWifiName": "Vui lòng nhập tên Wi‑Fi.",
@@ -344,6 +364,14 @@ function setStatus(message, type = "") {
   }
   statusText.textContent = message || "";
   statusText.className = `status ${type}`.trim();
+}
+
+function setSavedWifiStatus(message, type = "") {
+  if (!savedWifiStatus) {
+    return;
+  }
+  savedWifiStatus.textContent = message || "";
+  savedWifiStatus.className = `hint saved-wifi-status ${type}`.trim();
 }
 
 function setBadge(el, text, variant = "") {
@@ -637,6 +665,8 @@ function ensureUiBindings() {
     [metricTvoc, "metricTvoc"],
     [metricTemp, "metricTemp"],
     [metricHumidity, "metricHumidity"],
+    [savedWifiList, "savedWifiList"],
+    [savedWifiStatus, "savedWifiStatus"],
     [scanList, "scanList"],
     [scanBtn, "scanBtn"],
     [enablePortalBtn, "enablePortalBtn"],
@@ -763,6 +793,7 @@ function renderState(state) {
   setBadge(qrModeBadge, state.provisioning ? t("badge.setupReady") : t("badge.directLink"), state.provisioning ? "ok" : "muted");
   qrCaption.textContent = state.provisioning ? t("qr.caption.provisioning") : t("qr.caption.runtime");
   renderQrCode(qrCanvas, accessUrl);
+  renderSavedNetworks(state.savedNetworks || []);
 
   enablePortalBtn.disabled = !state.canStartPortal;
 
@@ -772,6 +803,104 @@ function renderState(state) {
   if (!wifiFormDirty) {
     hiddenInput.checked = Boolean(state.hiddenSsid);
   }
+}
+
+function renderSavedNetworks(items) {
+  savedWifiList.innerHTML = "";
+
+  if (!items || items.length === 0) {
+    setSavedWifiStatus("");
+    const empty = document.createElement("p");
+    empty.className = "hint saved-wifi-empty";
+    empty.textContent = t("status.savedWifiEmpty");
+    savedWifiList.appendChild(empty);
+    return;
+  }
+
+  items.forEach((item) => {
+    const row = document.createElement("article");
+    row.className = "saved-wifi-item";
+
+    const main = document.createElement("div");
+    main.className = "saved-wifi-main";
+
+    const title = document.createElement("div");
+    title.className = "saved-wifi-title";
+
+    const ssid = document.createElement("span");
+    ssid.className = "saved-wifi-ssid";
+    ssid.textContent = item.ssid || t("label.none");
+    title.appendChild(ssid);
+
+    if (item.active) {
+      const activeChip = document.createElement("span");
+      activeChip.className = "saved-wifi-chip active";
+      activeChip.textContent = t("status.savedWifiCurrent");
+      title.appendChild(activeChip);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "saved-wifi-meta";
+
+    const readyChip = document.createElement("span");
+    readyChip.className = "saved-wifi-chip";
+    readyChip.textContent = t("status.savedWifiReady");
+    meta.appendChild(readyChip);
+
+    if (item.hidden) {
+      const hiddenChip = document.createElement("span");
+      hiddenChip.className = "saved-wifi-chip";
+      hiddenChip.textContent = t("status.savedWifiHidden");
+      meta.appendChild(hiddenChip);
+    }
+
+    main.appendChild(title);
+    main.appendChild(meta);
+
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "btn ghost saved-wifi-action";
+    action.textContent = t("status.savedWifiUse");
+    action.disabled = Boolean(item.active);
+    action.addEventListener("click", async () => {
+      action.disabled = true;
+      setSavedWifiStatus(
+        item.ssid
+          ? t("status.savedWifiConnecting", { ssid: item.ssid })
+          : t("status.savedWifiSelected"),
+        "warn"
+      );
+      setStatus(
+        item.ssid
+          ? t("status.savedWifiConnecting", { ssid: item.ssid })
+          : t("status.savedWifiSelected"),
+        "warn"
+      );
+
+      try {
+        const body = new URLSearchParams();
+        body.set("slot", String(item.slot));
+        const result = await fetchJson("/api/wifi/history/use", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+        });
+        setStatus(result.message || t("status.connectedSaved"), "ok");
+        setSavedWifiStatus(result.message || t("status.connectedSaved"), "ok");
+      } catch (error) {
+        setStatus(error.message, "bad");
+        setSavedWifiStatus(error.message, "bad");
+      } finally {
+        await loadState().catch(() => {});
+      }
+    });
+
+    row.appendChild(main);
+    row.appendChild(action);
+    savedWifiList.appendChild(row);
+  });
 }
 
 async function loadTelemetry() {

@@ -19,17 +19,20 @@ typedef enum {
   LOCAL_CONTROL_ACTION_DISCONNECT_WIFI,
   LOCAL_CONTROL_ACTION_STOP_PORTAL,
   LOCAL_CONTROL_ACTION_FORGET_WIFI,
+  LOCAL_CONTROL_ACTION_USE_SAVED_WIFI,
 } local_control_action_t;
 
 typedef struct {
   bool visible;
   bool requested_visible;
   bool wifi_actions_visible;
+  bool wifi_saved_visible;
   bool alarm_editor_visible;
   bool alarm_edit_adjusting;
   local_screen_t active_screen;
   int selected_index;
   int wifi_action_selected;
+  int wifi_saved_selected;
   int alarm_edit_selected;
   uint8_t alarm_edit_hour;
   uint8_t alarm_edit_minute;
@@ -38,18 +41,22 @@ typedef struct {
   int highlight_velocity_q8;
   int overlay_progress_q8;
   uint8_t pulse_phase;
+  uint8_t wifi_notice_kind;
+  uint16_t wifi_notice_timer;
 } local_menu_state_t;
 
 typedef enum {
   UI_FLOW_EVENT_SET_SCREEN = 0,
   UI_FLOW_EVENT_MEMORY_PHOTO_UPDATED,
   UI_FLOW_EVENT_MEMORY_PHOTO_CLEARED,
+  UI_FLOW_EVENT_WIFI_NOTICE,
 } ui_flow_event_type_t;
 
 typedef struct {
   ui_flow_event_type_t type;
   local_screen_t screen;
   bool show_menu;
+  int value;
 } ui_flow_event_t;
 
 void ui_flow_init(void);
@@ -59,6 +66,7 @@ void ui_flow_update_smoke(int aqi);
 void ui_flow_dispatch(const ui_flow_event_t *event);
 void ui_flow_handle_encoder_rotate(int steps);
 void ui_flow_handle_encoder_press(void);
-bool ui_flow_take_pending_action(local_control_action_t *out_action);
+bool ui_flow_take_pending_action(local_control_action_t *out_action,
+                                 int *out_value);
 
 #endif
