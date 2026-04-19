@@ -39,5 +39,7 @@ local_menu_state_t ui_flow_snapshot(void);
 void ui_flow_tick(void);
 void ui_flow_update_smoke(int aqi);
 void ui_flow_dispatch(const ui_flow_event_t *event);
+void ui_flow_handle_encoder_rotate(int steps);
+void ui_flow_handle_encoder_press(void);
 
 #endif

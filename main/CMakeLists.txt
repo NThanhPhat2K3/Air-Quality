@@ -4,6 +4,7 @@ idf_component_register(
          "app/app_state_machine.c"
          "app/dashboard_state.c"
          "drivers/display_hal.c"
+         "drivers/encoder_input.c"
          "services/captive_dns.c"
          "services/connectivity_service.c"
          "services/memory_photo_service.c"
