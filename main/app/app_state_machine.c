@@ -2,8 +2,6 @@
 
 #include <string.h>
 
-#include "connectivity_service.h"
-#include "dashboard_state.h"
 #include "display_hal.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -22,14 +20,6 @@ typedef enum {
   APP_PHASE_BOOT_DASHBOARD_READY,
   APP_PHASE_RUNNING,
 } app_phase_t;
-
-typedef struct {
-  dashboard_state_t dashboard;
-  connectivity_ui_status_t wifi_status;
-  bool time_synced;
-} app_runtime_context_t;
-
-static app_runtime_context_t s_runtime;
 
 static void app_phase_transition(app_state_machine_t *sm, app_phase_t next) {
   sm->phase = (int)next;
@@ -56,10 +46,10 @@ static void app_dashboard_refresh(app_state_machine_t *sm, bool force_refresh) {
     return;
   }
 
-  s_runtime.time_synced = connectivity_service_is_time_synced();
-  dashboard_state_build_runtime(&s_runtime.dashboard, &s_runtime.time_synced);
-  connectivity_service_set_time_synced(s_runtime.time_synced);
-  dashboard_state_snapshot_store(&s_runtime.dashboard);
+  sm->time_synced = connectivity_service_is_time_synced();
+  dashboard_state_build_runtime(&sm->dashboard, &sm->time_synced);
+  connectivity_service_set_time_synced(sm->time_synced);
+  dashboard_state_snapshot_store(&sm->dashboard);
   sm->last_sensor_refresh_us = now_us;
 }
 
@@ -82,7 +72,6 @@ void app_state_machine_init(app_state_machine_t *sm) {
   }
 
   memset(sm, 0, sizeof(*sm));
-  memset(&s_runtime, 0, sizeof(s_runtime));
   sm->phase = APP_PHASE_BOOT_POWER_STABLE;
   sm->phase_started_us = esp_timer_get_time();
 }
@@ -165,19 +154,20 @@ void app_state_machine_tick(app_state_machine_t *sm) {
     }
 
     app_dashboard_refresh(sm, false);
-    ui_flow_update_smoke(s_runtime.dashboard.aqi);
+    ui_flow_update_smoke(sm->dashboard.aqi);
     ui_flow_tick();
-    connectivity_service_get_ui_status(&s_runtime.wifi_status);
+    connectivity_service_get_ui_status(&sm->wifi_status);
 
 #if SHOW_BITMAP_UI
     {
       local_menu_state_t menu = ui_flow_snapshot();
-      ui_renderer_draw_local_screen(&s_runtime.dashboard, &menu,
-                                    &s_runtime.wifi_status);
+      ui_renderer_draw_local_screen(&sm->dashboard, &menu,
+                                    &sm->wifi_status);
     }
 #else
-    ui_renderer_draw_dashboard(&s_runtime.dashboard,
-                               s_runtime.wifi_status.connected);
+    ui_renderer_draw_dashboard(&sm->dashboard,
+                               sm->wifi_status.connected,
+                               sm->wifi_status.provisioning_portal_active);
 #endif
     lcd_present_framebuffer();
     break;

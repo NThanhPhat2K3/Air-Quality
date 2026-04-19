@@ -96,18 +96,25 @@ static esp_netif_t *s_wifi_ap_netif;
 static TaskHandle_t s_clock_sync_task_handle;
 static TimerHandle_t s_clock_sync_timer;
 static httpd_handle_t s_config_http_server;
-static int s_wifi_retry_num;
+/*
+ * These Wi-Fi flags/counters are touched from multiple FreeRTOS contexts.
+ * Use _Atomic so individual loads/stores stay race-free and visible across
+ * cores.  This does NOT make multi-field state transitions atomic; grouped
+ * state still needs explicit locking/snapshot rules.
+ */
+static _Atomic int s_wifi_retry_num;
 static bool s_time_synced;
-static bool s_wifi_should_connect;
+static _Atomic bool s_wifi_should_connect;
 static bool s_wifi_driver_ready;
 static bool s_wifi_credentials_loaded;
-static bool s_provisioning_portal_active;
-static bool s_provisioning_auto_opened;
+static _Atomic bool s_provisioning_portal_active;
+static _Atomic bool s_provisioning_auto_opened;
 static bool s_restart_scheduled;
+static bool s_http_server_recycle_scheduled;
 static bool s_mdns_ready;
 static int64_t s_last_credentials_write_us;
-static int s_wifi_connect_fail_cycles;
-static int s_wifi_target_missing_cycles;
+static _Atomic int s_wifi_connect_fail_cycles;
+static _Atomic int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
 static char s_provisioning_ap_ssid[33];
 static portMUX_TYPE s_connectivity_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -132,6 +139,9 @@ static void wifi_refresh_credentials_cache(void);
 static void wifi_clear_status_bits(void);
 static bool start_provisioning_portal(void);
 static bool stop_provisioning_portal(void);
+static bool start_config_http_server(void);
+static void stop_config_http_server(void);
+static void schedule_http_server_recycle(uint32_t delay_ms);
 static void fill_sta_wifi_config(wifi_config_t *wifi_config);
 static void ensure_mdns_service(void);
 static wifi_target_scan_result_t wifi_scan_for_target_ssid(void);
@@ -154,6 +164,14 @@ static bool is_placeholder_credentials(const char *ssid, const char *password) {
     return true;
   }
   return false;
+}
+
+static wifi_credentials_t wifi_credentials_snapshot(void) {
+  wifi_credentials_t snap;
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  snap = s_wifi_credentials;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+  return snap;
 }
 
 static void wifi_set_credentials_cache(const char *ssid, const char *password,
@@ -222,12 +240,13 @@ static bool wifi_credentials_equal(const char *ssid, const char *password,
     return false;
   }
   wifi_refresh_credentials_cache();
-  if (!s_wifi_credentials.valid) {
+  wifi_credentials_t creds = wifi_credentials_snapshot();
+  if (!creds.valid) {
     return false;
   }
-  return strcmp(s_wifi_credentials.ssid, ssid) == 0 &&
-         strcmp(s_wifi_credentials.password, safe_password) == 0 &&
-         s_wifi_credentials.hidden == hidden;
+  return strcmp(creds.ssid, ssid) == 0 &&
+         strcmp(creds.password, safe_password) == 0 &&
+         creds.hidden == hidden;
 }
 
 static esp_err_t wifi_save_credentials_to_nvs(const char *ssid,
@@ -291,7 +310,7 @@ static void wifi_refresh_credentials_cache(void) {
 
   if (wifi_load_credentials_from_nvs()) {
     ESP_LOGI(TAG, "Wi-Fi credentials loaded from NVS (ssid=%s)",
-             s_wifi_credentials.ssid);
+             wifi_credentials_snapshot().ssid);
     s_wifi_credentials_loaded = true;
     return;
   }
@@ -299,7 +318,7 @@ static void wifi_refresh_credentials_cache(void) {
   if (!is_placeholder_credentials(WIFI_SSID, WIFI_PASS)) {
     wifi_set_credentials_cache(WIFI_SSID, WIFI_PASS, false, false);
     ESP_LOGI(TAG, "Wi-Fi credentials loaded from compile-time config (ssid=%s)",
-             s_wifi_credentials.ssid);
+             wifi_credentials_snapshot().ssid);
   } else {
     wifi_set_credentials_cache("", "", false, false);
     ESP_LOGW(TAG, "No Wi-Fi credentials configured; start provisioning portal");
@@ -330,7 +349,7 @@ static esp_err_t wifi_erase_credentials_nvs(void) {
 
 static bool wifi_credentials_configured(void) {
   wifi_refresh_credentials_cache();
-  return s_wifi_credentials.valid;
+  return wifi_credentials_snapshot().valid;
 }
 
 static wifi_test_result_t wifi_test_credentials(const char *ssid,
@@ -430,6 +449,9 @@ static wifi_test_result_t wifi_test_credentials(const char *ssid,
 
   if ((bits & WIFI_CONNECTED_BIT) != 0) {
     ESP_LOGI(TAG, "wifi_test: credentials verified OK");
+    if (s_provisioning_portal_active) {
+      schedule_http_server_recycle(400);
+    }
     return WIFI_TEST_RESULT_CONNECTED;
   }
 
@@ -746,6 +768,22 @@ static bool read_http_body(httpd_req_t *req, char *out, size_t out_len) {
   return true;
 }
 
+static void get_netif_ip_string(esp_netif_t *netif, char *out, size_t out_len) {
+  if (out == NULL || out_len == 0) {
+    return;
+  }
+
+  out[0] = '\0';
+  if (netif == NULL) {
+    return;
+  }
+
+  esp_netif_ip_info_t ip_info = {0};
+  if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+    snprintf(out, out_len, IPSTR, IP2STR(&ip_info.ip));
+  }
+}
+
 static bool read_http_body_bytes(httpd_req_t *req, uint8_t *out,
                                  size_t expected_len) {
   size_t received = 0;
@@ -820,9 +858,13 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
   char escaped_ssid[160];
   char escaped_ap_ssid[160];
   char runtime_ip[20] = "";
+  char ap_ip[20] = "";
+  char escaped_access_url[96];
   char payload[WIFI_STATE_JSON_MAX_LEN];
   wifi_credentials_t creds_snap;
   bool portal_snap;
+  const char *access_ip = NULL;
+  char access_url[80] = "";
 
   portENTER_CRITICAL(&s_connectivity_state_lock);
   creds_snap = s_wifi_credentials;
@@ -833,19 +875,25 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
               escaped_ssid, sizeof(escaped_ssid));
   json_escape(s_provisioning_ap_ssid, escaped_ap_ssid, sizeof(escaped_ap_ssid));
 
-  if (s_wifi_sta_netif != NULL) {
-    esp_netif_ip_info_t ip_info = {0};
-    if (esp_netif_get_ip_info(s_wifi_sta_netif, &ip_info) == ESP_OK) {
-      snprintf(runtime_ip, sizeof(runtime_ip), IPSTR, IP2STR(&ip_info.ip));
-    }
+  get_netif_ip_string(s_wifi_sta_netif, runtime_ip, sizeof(runtime_ip));
+  get_netif_ip_string(s_wifi_ap_netif, ap_ip, sizeof(ap_ip));
+
+  access_ip = portal_snap ? ap_ip : runtime_ip;
+  if (access_ip[0] != '\0') {
+    snprintf(access_url, sizeof(access_url), "http://%s/", access_ip);
+  } else if (!portal_snap) {
+    snprintf(access_url, sizeof(access_url), "http://%s.local/",
+             CONNECTIVITY_RUNTIME_HOSTNAME);
   }
+  json_escape(access_url, escaped_access_url, sizeof(escaped_access_url));
 
   snprintf(payload, sizeof(payload),
            "{\"ok\":true,\"mode\":\"%s\",\"connected\":%s,"
            "\"provisioning\":%s,\"credentialSource\":\"%s\","
            "\"currentSsid\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
            "\"hiddenSsid\":%s,\"canStartPortal\":%s,\"runtimeIp\":\"%s\","
-           "\"runtimeHost\":\"%s.local\"}",
+           "\"runtimeHost\":\"%s.local\",\"apIp\":\"%s\","
+           "\"accessIp\":\"%s\",\"accessUrl\":\"%s\"}",
            portal_snap ? "provisioning" : "runtime",
            connectivity_service_is_wifi_connected() ? "true" : "false",
            portal_snap ? "true" : "false",
@@ -855,7 +903,7 @@ static esp_err_t config_state_get_handler(httpd_req_t *req) {
            escaped_ssid, escaped_ap_ssid, WIFI_PROVISIONING_AP_PASS,
            creds_snap.hidden ? "true" : "false",
            creds_snap.valid ? "true" : "false", runtime_ip,
-           CONNECTIVITY_RUNTIME_HOSTNAME);
+           CONNECTIVITY_RUNTIME_HOSTNAME, ap_ip, access_ip, escaped_access_url);
 
   return send_json_response(req, "200 OK", payload);
 }
@@ -1180,6 +1228,14 @@ static esp_err_t config_wifi_post_handler(httpd_req_t *req) {
   }
 
   if (!did_write) {
+    if (s_provisioning_portal_active) {
+      if (!stop_provisioning_portal()) {
+        return send_json_message(req, "500 Internal Server Error", false,
+                                 "Connected, but failed to close setup hotspot");
+      }
+      return send_json_message(req, "200 OK", true,
+                               "Connected. Setup hotspot closed.");
+    }
     return send_json_message(req, "200 OK", true,
                              "Credentials verified and unchanged.");
   }
@@ -1224,18 +1280,22 @@ static esp_err_t config_provisioning_stop_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t config_wifi_disconnect_post_handler(httpd_req_t *req) {
-  if (!connectivity_service_is_wifi_connected()) {
-    return send_json_message(req, "200 OK", true,
-                             "Wi-Fi is already disconnected.");
+  if (connectivity_service_is_wifi_connected()) {
+    s_wifi_should_connect = false;
+    esp_err_t ret = esp_wifi_disconnect();
+    if (ret != ESP_OK) {
+      return send_json_message(req, "500 Internal Server Error", false,
+                               "Failed to disconnect Wi-Fi");
+    }
+    ESP_LOGI(TAG, "Wi-Fi disconnected by user request");
   }
-  s_wifi_should_connect = false;
-  esp_err_t ret = esp_wifi_disconnect();
-  if (ret != ESP_OK) {
+
+  if (!start_provisioning_portal()) {
     return send_json_message(req, "500 Internal Server Error", false,
-                             "Failed to disconnect Wi-Fi");
+                             "Wi-Fi disconnected, but setup hotspot failed");
   }
-  ESP_LOGI(TAG, "Wi-Fi disconnected by user request");
-  return send_json_message(req, "200 OK", true, "Wi-Fi disconnected.");
+  return send_json_message(req, "200 OK", true,
+                           "Wi-Fi disconnected. Setup hotspot is active.");
 }
 
 static esp_err_t config_wifi_forget_post_handler(httpd_req_t *req) {
@@ -1268,6 +1328,7 @@ static bool start_config_http_server(void) {
   config.max_uri_handlers = 28;
   config.stack_size = 6144;
   config.uri_match_fn = httpd_uri_match_wildcard;
+  config.lru_purge_enable = true;
 
   ret = httpd_start(&s_config_http_server, &config);
   if (ret != ESP_OK) {
@@ -1350,6 +1411,41 @@ static bool start_config_http_server(void) {
   return true;
 }
 
+static void stop_config_http_server(void) {
+  if (s_config_http_server == NULL) {
+    return;
+  }
+
+  httpd_stop(s_config_http_server);
+  s_config_http_server = NULL;
+  ESP_LOGI(TAG, "Config web server stopped");
+}
+
+static void recycle_http_server_task(void *arg) {
+  uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
+
+  vTaskDelay(pdMS_TO_TICKS(delay_ms));
+  stop_config_http_server();
+  start_config_http_server();
+  s_http_server_recycle_scheduled = false;
+  vTaskDelete(NULL);
+}
+
+static void schedule_http_server_recycle(uint32_t delay_ms) {
+  if (s_http_server_recycle_scheduled) {
+    return;
+  }
+
+  s_http_server_recycle_scheduled = true;
+  BaseType_t ok =
+      xTaskCreate(recycle_http_server_task, "httpd_recycle", 3072,
+                  (void *)(uintptr_t)delay_ms, 4, NULL);
+  if (ok != pdPASS) {
+    s_http_server_recycle_scheduled = false;
+    ESP_LOGW(TAG, "Failed to schedule HTTP server recycle");
+  }
+}
+
 static void ensure_provisioning_ap_ssid(void) {
   if (s_provisioning_ap_ssid[0] != '\0') {
     return;
@@ -1378,6 +1474,7 @@ static bool start_provisioning_portal(void) {
       ESP_LOGW(TAG, "Captive DNS already-portal start failed: %s",
                esp_err_to_name(dns_ret));
     }
+    schedule_http_server_recycle(250);
     return true;
   }
 
@@ -1459,6 +1556,7 @@ static bool start_provisioning_portal(void) {
   if (!start_config_http_server()) {
     return false;
   }
+  schedule_http_server_recycle(250);
 
   esp_err_t dns_ret = captive_dns_start();
   if (dns_ret != ESP_OK) {
@@ -1511,6 +1609,7 @@ static void ensure_runtime_config_server(void) {
     ESP_LOGW(TAG, "Captive DNS stop failed: %s", esp_err_to_name(dns_ret));
   }
 
+  stop_config_http_server();
   if (!start_config_http_server()) {
     ESP_LOGW(TAG, "Runtime config web server failed to start");
   }
@@ -1709,12 +1808,15 @@ static void fill_sta_wifi_config(wifi_config_t *wifi_config) {
   wifi_config->sta.pmf_cfg.capable = true;
   wifi_config->sta.pmf_cfg.required = false;
 
-  strlcpy((char *)wifi_config->sta.ssid, s_wifi_credentials.ssid,
-          sizeof(wifi_config->sta.ssid));
-  strlcpy((char *)wifi_config->sta.password, s_wifi_credentials.password,
-          sizeof(wifi_config->sta.password));
-  if (s_wifi_credentials.password[0] == '\0') {
-    wifi_config->sta.threshold.authmode = WIFI_AUTH_OPEN;
+  {
+    wifi_credentials_t creds = wifi_credentials_snapshot();
+    strlcpy((char *)wifi_config->sta.ssid, creds.ssid,
+            sizeof(wifi_config->sta.ssid));
+    strlcpy((char *)wifi_config->sta.password, creds.password,
+            sizeof(wifi_config->sta.password));
+    if (creds.password[0] == '\0') {
+      wifi_config->sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
   }
 }
 
@@ -1734,9 +1836,10 @@ static wifi_target_scan_result_t wifi_scan_for_target_ssid(void) {
   if (!wifi_credentials_configured()) {
     return WIFI_TARGET_SCAN_ERROR;
   }
-  if (s_wifi_credentials.hidden) {
+  wifi_credentials_t scan_creds = wifi_credentials_snapshot();
+  if (scan_creds.hidden) {
     ESP_LOGI(TAG, "Target SSID '%s' is marked hidden; skip visibility scan",
-             s_wifi_credentials.ssid);
+             scan_creds.ssid);
     return WIFI_TARGET_SCAN_ERROR;
   }
 
@@ -1758,7 +1861,7 @@ static wifi_target_scan_result_t wifi_scan_for_target_ssid(void) {
 
   if (ap_count == 0) {
     ESP_LOGW(TAG, "No AP found while scanning for target SSID '%s'",
-             s_wifi_credentials.ssid);
+             scan_creds.ssid);
     return WIFI_TARGET_SCAN_NOT_FOUND;
   }
 
@@ -1780,17 +1883,17 @@ static wifi_target_scan_result_t wifi_scan_for_target_ssid(void) {
   }
 
   for (uint16_t i = 0; i < ap_count; ++i) {
-    if (strncmp((const char *)ap_records[i].ssid, s_wifi_credentials.ssid,
-                sizeof(s_wifi_credentials.ssid)) == 0) {
+    if (strncmp((const char *)ap_records[i].ssid, scan_creds.ssid,
+                sizeof(scan_creds.ssid)) == 0) {
       ESP_LOGI(TAG, "Target SSID '%s' is visible (RSSI=%d)",
-               s_wifi_credentials.ssid, ap_records[i].rssi);
+               scan_creds.ssid, ap_records[i].rssi);
       result = WIFI_TARGET_SCAN_FOUND;
       goto cleanup;
     }
   }
 
   ESP_LOGW(TAG, "Target SSID '%s' not visible in current scan",
-           s_wifi_credentials.ssid);
+           scan_creds.ssid);
   result = WIFI_TARGET_SCAN_NOT_FOUND;
 
 cleanup:
@@ -2025,6 +2128,11 @@ static void clock_sync_task(void *arg) {
   (void)arg;
 
   while (true) {
+    bool cycle_has_valid_time;
+    bool portal_active;
+    bool runtime_connected;
+    uint32_t next_retry_ms;
+
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     if (s_wifi_event_group != NULL) {
@@ -2044,8 +2152,15 @@ static void clock_sync_task(void *arg) {
       xEventGroupSetBits(s_wifi_event_group, bits);
     }
 
-    schedule_clock_sync_retry(s_time_synced ? CLOCK_SYNC_SUCCESS_INTERVAL_MS
-                                            : CLOCK_SYNC_RETRY_INTERVAL_MS);
+    cycle_has_valid_time = synced || is_system_time_valid();
+    portal_active = s_provisioning_portal_active;
+    runtime_connected =
+        connectivity_service_is_wifi_connected() && !portal_active;
+    next_retry_ms =
+        (runtime_connected && cycle_has_valid_time)
+            ? CLOCK_SYNC_SUCCESS_INTERVAL_MS
+            : CLOCK_SYNC_RETRY_INTERVAL_MS;
+    schedule_clock_sync_retry(next_retry_ms);
   }
 }
 
@@ -2109,11 +2224,13 @@ void connectivity_service_set_time_synced(bool time_synced) {
 }
 
 bool connectivity_service_disconnect_wifi(void) {
-  if (!connectivity_service_is_wifi_connected()) {
-    return true;
+  if (connectivity_service_is_wifi_connected()) {
+    s_wifi_should_connect = false;
+    if (esp_wifi_disconnect() != ESP_OK) {
+      return false;
+    }
   }
-  s_wifi_should_connect = false;
-  return esp_wifi_disconnect() == ESP_OK;
+  return start_provisioning_portal();
 }
 
 bool connectivity_service_stop_provisioning(void) {
@@ -2141,20 +2258,24 @@ void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {
   portENTER_CRITICAL(&s_connectivity_state_lock);
   out->provisioning_portal_active = s_provisioning_portal_active;
   out->credentials_valid = s_wifi_credentials.valid;
-  strlcpy(out->ssid, s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE",
-          sizeof(out->ssid));
+  if (out->provisioning_portal_active && s_provisioning_ap_ssid[0] != '\0') {
+    strlcpy(out->ssid, s_provisioning_ap_ssid, sizeof(out->ssid));
+  } else if (!out->connected) {
+    strlcpy(out->ssid, "DISCONNECTED", sizeof(out->ssid));
+  } else {
+    strlcpy(out->ssid, s_wifi_credentials.valid ? s_wifi_credentials.ssid : "NONE",
+            sizeof(out->ssid));
+  }
   portEXIT_CRITICAL(&s_connectivity_state_lock);
 
-  if (s_wifi_sta_netif != NULL) {
-    esp_netif_ip_info_t ip_info = {0};
-    if (esp_netif_get_ip_info(s_wifi_sta_netif, &ip_info) == ESP_OK &&
-        ip_info.ip.addr != 0) {
-      snprintf(out->runtime_ip, sizeof(out->runtime_ip), IPSTR,
-               IP2STR(&ip_info.ip));
-    } else {
-      strlcpy(out->runtime_ip, "NO IP", sizeof(out->runtime_ip));
-    }
+  if (out->provisioning_portal_active) {
+    get_netif_ip_string(s_wifi_ap_netif, out->runtime_ip, sizeof(out->runtime_ip));
   } else {
+    get_netif_ip_string(s_wifi_sta_netif, out->runtime_ip,
+                        sizeof(out->runtime_ip));
+  }
+
+  if (out->runtime_ip[0] == '\0') {
     strlcpy(out->runtime_ip, "NO IP", sizeof(out->runtime_ip));
   }
 }

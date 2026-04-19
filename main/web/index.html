@@ -15,28 +15,33 @@
     <main class="shell">
       <aside class="sidebar panel">
         <div class="brand">
-          <p class="eyebrow">Air Quality Node</p>
-          <h1>Control Center</h1>
+          <p class="eyebrow" data-i18n="brand.eyebrow">Air Quality Node</p>
+          <h1 data-i18n="brand.title">Control Center</h1>
+        </div>
+
+        <div class="lang-switch" aria-label="Language switch">
+          <button id="langEnBtn" class="lang-btn active" data-lang="en" type="button">EN</button>
+          <button id="langViBtn" class="lang-btn" data-lang="vi" type="button">VI</button>
         </div>
 
         <nav class="tabs" aria-label="Main sections">
-          <button class="tab-btn active" data-tab="monitoring" type="button">Monitoring</button>
-          <button class="tab-btn" data-tab="wifi" type="button">Wi-Fi Config</button>
-          <button class="tab-btn" data-tab="memory" type="button">Memory</button>
-          <button class="tab-btn" data-tab="alarm" type="button">Alarm</button>
+          <button class="tab-btn active" data-tab="monitoring" type="button" data-i18n="tab.monitoring">Monitoring</button>
+          <button class="tab-btn" data-tab="wifi" type="button" data-i18n="tab.wifi">Wi-Fi Config</button>
+          <button class="tab-btn" data-tab="memory" type="button" data-i18n="tab.memory">Memory</button>
+          <button class="tab-btn" data-tab="alarm" type="button" data-i18n="tab.alarm">Alarm</button>
         </nav>
 
         <section class="side-meta">
           <div class="meta-row">
-            <span>Mode</span>
+            <span data-i18n="meta.mode">Mode</span>
             <span id="modeBadge" class="badge">Loading</span>
           </div>
           <div class="meta-row">
-            <span>Network</span>
+            <span data-i18n="meta.network">Network</span>
             <span id="linkBadge" class="badge muted">Checking</span>
           </div>
           <div class="meta-row">
-            <span>Access</span>
+            <span data-i18n="meta.access">Access</span>
             <span id="runtimeIp" class="small-value">-</span>
           </div>
         </section>
@@ -45,8 +50,8 @@
       <section class="content panel">
         <section class="tab-panel active" data-panel="monitoring">
           <header class="panel-head">
-            <h2>Live Monitoring</h2>
-            <p class="hint">Realtime values from the running device.</p>
+            <h2 data-i18n="monitoring.title">Live Monitoring</h2>
+            <p class="hint" data-i18n="monitoring.hint">Realtime values from the running device.</p>
           </header>
 
           <section class="monitor-layout">
@@ -56,7 +61,7 @@
                 <span id="metricAqiState" class="metric-chip">Waiting</span>
               </div>
               <p id="metricAqi" class="metric-value metric-value-hero">-</p>
-              <p class="metric-note">Primary comfort signal for the room right now.</p>
+              <p class="metric-note" data-i18n="monitoring.note">Primary comfort signal for the room right now.</p>
             </article>
 
             <div class="metric-grid">
@@ -82,85 +87,145 @@
 
         <section class="tab-panel" data-panel="wifi">
           <header class="panel-head">
-            <h2>Wi-Fi Configuration</h2>
-            <p class="hint">Provisioning, scan nearby networks, and save credentials safely.</p>
+            <h2 data-i18n="wifi.title">Connect Device to Wi-Fi</h2>
+            <p class="hint" data-i18n="wifi.hint">Use the setup hotspot, choose a Wi-Fi network, then let the device join it.</p>
           </header>
+
+          <section class="wifi-steps">
+            <article class="wifi-step-card">
+              <span class="wifi-step-index">1</span>
+              <div>
+                <strong data-i18n="wifi.step1.title">Open setup</strong>
+                <p data-i18n="wifi.step1.body">Connect to the device hotspot or tap the setup button below.</p>
+              </div>
+            </article>
+            <article class="wifi-step-card">
+              <span class="wifi-step-index">2</span>
+              <div>
+                <strong data-i18n="wifi.step2.title">Choose Wi-Fi</strong>
+                <p data-i18n="wifi.step2.body">Pick your home or office Wi-Fi, then enter the password if needed.</p>
+              </div>
+            </article>
+            <article class="wifi-step-card">
+              <span class="wifi-step-index">3</span>
+              <div>
+                <strong data-i18n="wifi.step3.title">Finish</strong>
+                <p data-i18n="wifi.step3.body">The device will connect and return to normal mode automatically.</p>
+              </div>
+            </article>
+          </section>
+
+          <section class="wifi-access-hero">
+            <article class="wifi-quick-card">
+              <div class="wifi-quick-copy">
+                <p class="wifi-quick-kicker" data-i18n="wifi.shortcut.kicker">Setup Shortcut</p>
+                <h3 data-i18n="wifi.shortcut.title">Scan this to open the device setup page</h3>
+                <p class="hint" data-i18n="wifi.shortcut.body">If setup mode is active, your phone can scan this QR and open the right page instantly.</p>
+              </div>
+              <div class="wifi-quick-grid">
+                <div class="wifi-quick-stat">
+                  <span class="wifi-quick-label" data-i18n="wifi.shortcut.hotspot">Device hotspot</span>
+                  <strong id="quickSsid">-</strong>
+                </div>
+                <div class="wifi-quick-stat">
+                  <span class="wifi-quick-label" data-i18n="wifi.shortcut.address">Open address</span>
+                  <strong id="quickAccessIp">-</strong>
+                </div>
+              </div>
+              <div class="wifi-quick-link">
+                <span class="wifi-quick-label" data-i18n="wifi.shortcut.link">Direct link</span>
+                <a id="quickAccessLink" href="#" target="_blank" rel="noreferrer">-</a>
+              </div>
+            </article>
+
+            <article id="qrAccessCard" class="wifi-qr-card">
+              <div class="wifi-qr-head">
+                <div>
+                  <p class="wifi-quick-kicker" data-i18n="wifi.qr.kicker">Phone Access</p>
+                  <h3 id="qrTitle">Setup QR</h3>
+                </div>
+                <span id="qrModeBadge" class="badge muted">Waiting</span>
+              </div>
+              <div id="qrCanvas" class="wifi-qr-canvas" aria-live="polite"></div>
+              <p id="qrCaption" class="hint">A QR code will appear here when the device has a page your phone can open.</p>
+            </article>
+          </section>
 
           <section class="meta-grid">
             <article class="meta-card">
-              <p class="meta-label">Current SSID</p>
+              <p class="meta-label" data-i18n="wifi.meta.current">Current Wi-Fi</p>
               <p id="currentSsid" class="meta-value">-</p>
             </article>
             <article class="meta-card">
-              <p class="meta-label">Provisioning AP</p>
+              <p class="meta-label" data-i18n="wifi.meta.hotspot">Setup hotspot</p>
               <p id="apInfo" class="meta-value">-</p>
             </article>
             <article class="meta-card">
-              <p class="meta-label">Credentials Source</p>
+              <p class="meta-label" data-i18n="wifi.meta.saved">Saved settings</p>
               <p id="credSource" class="meta-value">-</p>
             </article>
           </section>
 
           <section class="scan-block">
             <div class="scan-head">
-              <h3>Nearby Wi-Fi Networks</h3>
+              <h3 data-i18n="wifi.scan.title">Choose a Wi-Fi network</h3>
               <div class="scan-actions">
-                <button id="enablePortalBtn" class="btn ghost" type="button">Enable Setup Hotspot</button>
-                <button id="scanBtn" class="btn ghost" type="button">Scan</button>
+                <button id="enablePortalBtn" class="btn ghost" type="button" data-i18n="wifi.scan.portal">Open Setup Hotspot</button>
+                <button id="scanBtn" class="btn ghost" type="button" data-i18n="wifi.scan.find">Find Wi-Fi</button>
               </div>
             </div>
-            <p class="hint">Tap a network to fill SSID quickly.</p>
+            <p class="hint" data-i18n="wifi.scan.hint">Tap a network below to fill in the name automatically.</p>
             <div id="scanList" class="scan-list" aria-live="polite"></div>
           </section>
 
           <section class="form-block">
-            <h3>Connect Device</h3>
+            <h3 data-i18n="wifi.form.title">Enter Wi-Fi details</h3>
             <form id="wifiForm" autocomplete="off">
               <label class="field">
-                <span>SSID</span>
+                <span data-i18n="wifi.form.name">Wi-Fi name</span>
                 <input id="ssidInput" name="ssid" maxlength="32" required />
               </label>
               <label class="field">
-                <span>Password</span>
+                <span data-i18n="wifi.form.password">Password</span>
                 <input id="passwordInput" name="password" type="password" maxlength="64" />
               </label>
               <label class="check-field" for="hiddenInput">
                 <input id="hiddenInput" name="hidden" type="checkbox" />
-                <span>This is a hidden Wi-Fi network</span>
+                <span data-i18n="wifi.form.hidden">This Wi-Fi is hidden</span>
               </label>
-              <p class="hint">Leave password empty for open networks.</p>
-              <button id="saveBtn" class="btn primary" type="submit">Save &amp; Restart</button>
+              <p class="hint" data-i18n="wifi.form.hint">Leave the password empty only if this Wi-Fi does not require one.</p>
+              <button id="saveBtn" class="btn primary" type="submit" data-i18n="wifi.form.submit">Connect Device</button>
             </form>
           </section>
 
           <section class="form-block wifi-actions-block">
-            <h3>Wi-Fi Actions</h3>
+            <h3 data-i18n="wifi.actions.title">Advanced Actions</h3>
             <div class="wifi-actions">
-              <button id="disconnectBtn" class="btn ghost" type="button">Disconnect Wi-Fi</button>
-              <button id="forgetBtn" class="btn danger" type="button">Forget Credentials</button>
-              <button id="stopPortalBtn" class="btn ghost" type="button">Stop Provisioning</button>
+              <button id="disconnectBtn" class="btn ghost" type="button" data-i18n="wifi.actions.disconnect">Disconnect and Open Setup</button>
+              <button id="forgetBtn" class="btn danger" type="button" data-i18n="wifi.actions.forget">Erase Saved Wi-Fi</button>
+              <button id="stopPortalBtn" class="btn ghost" type="button" data-i18n="wifi.actions.stop">Close Setup Hotspot</button>
             </div>
           </section>
         </section>
 
         <section class="tab-panel" data-panel="alarm">
           <header class="panel-head">
-            <h2>Alarm Scheduler</h2>
-            <p class="hint">Set quick reminders in the web console (local browser storage).</p>
+            <h2 data-i18n="alarm.title">Alarm Scheduler</h2>
+            <p class="hint" data-i18n="alarm.hint">Set quick reminders in the web console (local browser storage).</p>
           </header>
 
           <section class="alarm-wrap">
             <label class="field">
-              <span>Alarm Time</span>
+              <span data-i18n="alarm.time">Alarm Time</span>
               <input id="alarmTime" type="time" />
             </label>
             <label class="field">
-              <span>Message</span>
-              <input id="alarmMessage" maxlength="80" placeholder="Check sensor and filters" />
+              <span data-i18n="alarm.message">Message</span>
+              <input id="alarmMessage" maxlength="80" placeholder="Check sensor and filters" data-i18n-placeholder="alarm.placeholder" />
             </label>
             <div class="alarm-actions">
-              <button id="alarmSaveBtn" class="btn primary" type="button">Save Alarm</button>
-              <button id="alarmClearBtn" class="btn ghost" type="button">Clear</button>
+              <button id="alarmSaveBtn" class="btn primary" type="button" data-i18n="alarm.save">Save Alarm</button>
+              <button id="alarmClearBtn" class="btn ghost" type="button" data-i18n="alarm.clear">Clear</button>
             </div>
             <p id="alarmInfo" class="hint">No alarm configured.</p>
           </section>

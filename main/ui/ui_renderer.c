@@ -124,6 +124,14 @@ static const uint16_t COLOR_ORANGE = RGB565(255, 145, 45);
 static const uint16_t COLOR_RED = RGB565(255, 78, 70);
 static const uint16_t COLOR_LIME_SOFT = RGB565(120, 235, 90);
 static const uint16_t COLOR_OLIVE = RGB565(68, 95, 30);
+static const uint16_t COLOR_QR_BG = RGB565(250, 252, 255);
+static const uint16_t COLOR_QR_FG = RGB565(8, 18, 30);
+
+#define QR_VERSION 3
+#define QR_SIZE 29
+#define QR_DATA_CODEWORDS 55
+#define QR_EC_CODEWORDS 15
+#define QR_ALIGNMENT_CENTER 22
 
 static int clamp_int(int value, int min_value, int max_value) {
   if (value < min_value) {
@@ -188,6 +196,72 @@ static int text5x7_width(const char *text, int scale) {
   return (int)strlen(text) * 6 * scale;
 }
 
+static void sanitize_url_text(const char *source, char *dest, size_t dest_size) {
+  size_t write = 0;
+
+  if (dest == NULL || dest_size == 0) {
+    return;
+  }
+  if (source == NULL) {
+    dest[0] = '\0';
+    return;
+  }
+
+  while (source[0] != '\0' && write + 1 < dest_size) {
+    unsigned char ch = (unsigned char)*source++;
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == ':' || ch == '/' || ch == '.' ||
+        ch == '-' || ch == '_') {
+      dest[write++] = (char)ch;
+    }
+  }
+  dest[write] = '\0';
+}
+
+static void truncate_text_to_width(const char *source, char *dest,
+                                   size_t dest_size, int max_width,
+                                   int glyph_width) {
+  size_t src_len;
+  int max_chars;
+
+  if (dest == NULL || dest_size == 0) {
+    return;
+  }
+  if (source == NULL || max_width <= 0 || glyph_width <= 0) {
+    dest[0] = '\0';
+    return;
+  }
+
+  src_len = strlen(source);
+  max_chars = max_width / glyph_width;
+  if (max_chars <= 0) {
+    dest[0] = '\0';
+    return;
+  }
+
+  if ((int)src_len <= max_chars && src_len + 1 <= dest_size) {
+    strlcpy(dest, source, dest_size);
+    return;
+  }
+
+  if (max_chars <= 3) {
+    size_t dots = (size_t)max_chars < dest_size - 1 ? (size_t)max_chars
+                                                    : dest_size - 1;
+    for (size_t i = 0; i < dots; ++i) {
+      dest[i] = '.';
+    }
+    dest[dots] = '\0';
+    return;
+  }
+
+  if ((size_t)max_chars >= dest_size) {
+    max_chars = (int)dest_size - 1;
+  }
+
+  memcpy(dest, source, (size_t)(max_chars - 3));
+  memcpy(dest + (max_chars - 3), "...", 4);
+}
+
 static void fb_draw_char(int x, int y, char c, uint16_t color, int scale) {
   const uint8_t *rows = font_lookup(c);
 
@@ -245,6 +319,296 @@ static void fb_draw_text5x7_centered(int center_x, int y, const char *text,
                                      uint16_t color, int scale) {
   fb_draw_text5x7(center_x - text5x7_width(text, scale) / 2, y, text, color,
                   scale);
+}
+
+static uint8_t gf_mul(uint8_t a, uint8_t b) {
+  uint8_t result = 0;
+
+  while (b != 0) {
+    if (b & 1U) {
+      result ^= a;
+    }
+    if (a & 0x80U) {
+      a = (uint8_t)((a << 1) ^ 0x1DU);
+    } else {
+      a <<= 1;
+    }
+    b >>= 1;
+  }
+  return result;
+}
+
+static void build_qr_generator_poly(uint8_t *poly, int degree) {
+  uint8_t next[QR_EC_CODEWORDS + 1] = {0};
+
+  memset(poly, 0, (size_t)(degree + 1));
+  poly[0] = 1;
+
+  for (int i = 0; i < degree; ++i) {
+    memset(next, 0, sizeof(next));
+    for (int j = 0; j <= i; ++j) {
+      uint8_t alpha = 1;
+      for (int k = 0; k < i; ++k) {
+        alpha = gf_mul(alpha, 2);
+      }
+      next[j] ^= poly[j];
+      next[j + 1] ^= gf_mul(poly[j], alpha);
+    }
+    memcpy(poly, next, (size_t)(degree + 1));
+  }
+}
+
+static bool build_qr_codewords(const char *text, uint8_t *codewords) {
+  uint8_t bits[QR_DATA_CODEWORDS * 8] = {0};
+  uint8_t data[QR_DATA_CODEWORDS] = {0};
+  uint8_t ec[QR_EC_CODEWORDS] = {0};
+  uint8_t generator[QR_EC_CODEWORDS + 1] = {0};
+  size_t len;
+  int bit_count = 0;
+
+  if (text == NULL || codewords == NULL) {
+    return false;
+  }
+
+  len = strlen(text);
+  if (len > 53) {
+    return false;
+  }
+
+#define PUSH_BITS(value, width)                                                 \
+  do {                                                                          \
+    for (int _bit = (width) - 1; _bit >= 0; --_bit) {                           \
+      bits[bit_count++] = (uint8_t)(((value) >> _bit) & 1U);                   \
+    }                                                                           \
+  } while (0)
+
+  PUSH_BITS(0x4, 4);
+  PUSH_BITS((unsigned)len, 8);
+  for (size_t i = 0; i < len; ++i) {
+    PUSH_BITS((unsigned char)text[i], 8);
+  }
+
+  for (int i = 0; i < 4 && bit_count < (QR_DATA_CODEWORDS * 8); ++i) {
+    bits[bit_count++] = 0;
+  }
+  while ((bit_count % 8) != 0) {
+    bits[bit_count++] = 0;
+  }
+
+  for (int i = 0; i < bit_count / 8; ++i) {
+    uint8_t byte = 0;
+    for (int bit = 0; bit < 8; ++bit) {
+      byte = (uint8_t)((byte << 1) | bits[i * 8 + bit]);
+    }
+    data[i] = byte;
+  }
+  for (int i = bit_count / 8; i < QR_DATA_CODEWORDS; ++i) {
+    data[i] = (i % 2 == 0) ? 0xEC : 0x11;
+  }
+
+  build_qr_generator_poly(generator, QR_EC_CODEWORDS);
+  for (int i = 0; i < QR_DATA_CODEWORDS; ++i) {
+    uint8_t factor = (uint8_t)(data[i] ^ ec[0]);
+    memmove(ec, ec + 1, (size_t)(QR_EC_CODEWORDS - 1));
+    ec[QR_EC_CODEWORDS - 1] = 0;
+    if (factor == 0) {
+      continue;
+    }
+    for (int j = 0; j < QR_EC_CODEWORDS; ++j) {
+      ec[j] ^= gf_mul(generator[j + 1], factor);
+    }
+  }
+
+  memcpy(codewords, data, QR_DATA_CODEWORDS);
+  memcpy(codewords + QR_DATA_CODEWORDS, ec, QR_EC_CODEWORDS);
+#undef PUSH_BITS
+  return true;
+}
+
+static void qr_set_module(bool modules[QR_SIZE][QR_SIZE],
+                          bool assigned[QR_SIZE][QR_SIZE], int x, int y,
+                          bool value) {
+  modules[y][x] = value;
+  assigned[y][x] = true;
+}
+
+static void qr_reserve_module(bool modules[QR_SIZE][QR_SIZE],
+                              bool assigned[QR_SIZE][QR_SIZE], int x, int y,
+                              bool value) {
+  if (!assigned[y][x]) {
+    modules[y][x] = value;
+    assigned[y][x] = true;
+  }
+}
+
+static void qr_draw_finder(bool modules[QR_SIZE][QR_SIZE],
+                           bool assigned[QR_SIZE][QR_SIZE], int left, int top) {
+  for (int y = -1; y <= 7; ++y) {
+    for (int x = -1; x <= 7; ++x) {
+      int xx = left + x;
+      int yy = top + y;
+      bool outer;
+      bool border;
+      bool inner;
+
+      if (xx < 0 || yy < 0 || xx >= QR_SIZE || yy >= QR_SIZE) {
+        continue;
+      }
+
+      outer = x >= 0 && x <= 6 && y >= 0 && y <= 6;
+      border = x == 0 || x == 6 || y == 0 || y == 6;
+      inner = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+      qr_set_module(modules, assigned, xx, yy, outer && (border || inner));
+    }
+  }
+}
+
+static void qr_draw_alignment(bool modules[QR_SIZE][QR_SIZE],
+                              bool assigned[QR_SIZE][QR_SIZE], int center_x,
+                              int center_y) {
+  for (int y = -2; y <= 2; ++y) {
+    for (int x = -2; x <= 2; ++x) {
+      int distance = abs(x) > abs(y) ? abs(x) : abs(y);
+      qr_set_module(modules, assigned, center_x + x, center_y + y,
+                    distance != 1);
+    }
+  }
+}
+
+static bool build_qr_matrix(const char *text, bool modules[QR_SIZE][QR_SIZE]) {
+  bool assigned[QR_SIZE][QR_SIZE] = {{false}};
+  uint8_t codewords[QR_DATA_CODEWORDS + QR_EC_CODEWORDS] = {0};
+  uint8_t bit_stream[(QR_DATA_CODEWORDS + QR_EC_CODEWORDS) * 8] = {0};
+  int bit_index = 0;
+  int direction = -1;
+  int format_data = (0x1 << 3);
+  int remainder;
+  int format;
+
+  memset(modules, 0, sizeof(bool) * QR_SIZE * QR_SIZE);
+  if (!build_qr_codewords(text, codewords)) {
+    return false;
+  }
+
+  qr_draw_finder(modules, assigned, 0, 0);
+  qr_draw_finder(modules, assigned, QR_SIZE - 7, 0);
+  qr_draw_finder(modules, assigned, 0, QR_SIZE - 7);
+  qr_draw_alignment(modules, assigned, QR_ALIGNMENT_CENTER, QR_ALIGNMENT_CENTER);
+
+  for (int i = 8; i < QR_SIZE - 8; ++i) {
+    qr_set_module(modules, assigned, i, 6, (i % 2) == 0);
+    qr_set_module(modules, assigned, 6, i, (i % 2) == 0);
+  }
+  qr_set_module(modules, assigned, 8, (4 * QR_VERSION) + 9, true);
+
+  for (int i = 0; i < 9; ++i) {
+    if (i != 6) {
+      qr_reserve_module(modules, assigned, 8, i, false);
+      qr_reserve_module(modules, assigned, i, 8, false);
+    }
+  }
+  for (int i = 0; i < 8; ++i) {
+    qr_reserve_module(modules, assigned, QR_SIZE - 1 - i, 8, false);
+    qr_reserve_module(modules, assigned, 8, QR_SIZE - 1 - i, false);
+  }
+
+  for (int i = 0; i < (QR_DATA_CODEWORDS + QR_EC_CODEWORDS); ++i) {
+    for (int bit = 7; bit >= 0; --bit) {
+      bit_stream[(i * 8) + (7 - bit)] = (uint8_t)((codewords[i] >> bit) & 1U);
+    }
+  }
+
+  bit_index = 0;
+  for (int x = QR_SIZE - 1; x > 0; x -= 2) {
+    if (x == 6) {
+      --x;
+    }
+    for (int step = 0; step < QR_SIZE; ++step) {
+      int y = direction == -1 ? (QR_SIZE - 1 - step) : step;
+      for (int dx = 0; dx < 2; ++dx) {
+        int xx = x - dx;
+        bool value;
+
+        if (assigned[y][xx]) {
+          continue;
+        }
+
+        value = bit_stream[bit_index++] == 1U;
+        if (((xx + y) % 2) == 0) {
+          value = !value;
+        }
+        modules[y][xx] = value;
+        assigned[y][xx] = true;
+      }
+    }
+    direction *= -1;
+  }
+
+  remainder = format_data << 10;
+  while (remainder >= (1 << 10)) {
+    int shift = (int)floor(log2((double)remainder)) - 10;
+    remainder ^= (0x537 << shift);
+  }
+  format = ((format_data << 10) | remainder) ^ 0x5412;
+
+  for (int i = 0; i <= 5; ++i) {
+    modules[i][8] = ((format >> i) & 1) != 0;
+  }
+  modules[7][8] = ((format >> 6) & 1) != 0;
+  modules[8][8] = ((format >> 7) & 1) != 0;
+  modules[8][7] = ((format >> 8) & 1) != 0;
+  for (int i = 9; i < 15; ++i) {
+    modules[8][14 - i] = ((format >> i) & 1) != 0;
+  }
+
+  for (int i = 0; i < 8; ++i) {
+    modules[8][QR_SIZE - 1 - i] = ((format >> i) & 1) != 0;
+  }
+  for (int i = 8; i < 15; ++i) {
+    modules[QR_SIZE - 15 + i][8] = ((format >> i) & 1) != 0;
+  }
+
+  return true;
+}
+
+static void draw_qr_block(int x, int y, int size, const char *text) {
+  bool modules[QR_SIZE][QR_SIZE];
+  const int quiet_zone = 4;
+  const int full_modules = QR_SIZE + (quiet_zone * 2);
+  int draw_size;
+  int offset_x;
+  int offset_y;
+
+  fb_fill_rect(x, y, size, size, COLOR_QR_BG);
+
+  if (text == NULL || text[0] == '\0' || !build_qr_matrix(text, modules)) {
+    fb_draw_text5x7_centered(x + (size / 2), y + 18, "QR", COLOR_QR_FG, 1);
+    fb_draw_text5x7_centered(x + (size / 2), y + 30, "WAIT", COLOR_MUTED, 1);
+    return;
+  }
+
+  draw_size = size;
+  offset_x = x + ((size - draw_size) / 2);
+  offset_y = y + ((size - draw_size) / 2);
+
+  for (int row = 0; row < QR_SIZE; ++row) {
+    for (int col = 0; col < QR_SIZE; ++col) {
+      int x0;
+      int y0;
+      int x1;
+      int y1;
+
+      if (!modules[row][col]) {
+        continue;
+      }
+
+      x0 = offset_x + (((col + quiet_zone) * draw_size) / full_modules);
+      y0 = offset_y + (((row + quiet_zone) * draw_size) / full_modules);
+      x1 = offset_x + ((((col + quiet_zone) + 1) * draw_size) / full_modules);
+      y1 = offset_y + ((((row + quiet_zone) + 1) * draw_size) / full_modules);
+      fb_fill_rect(x0, y0, x1 - x0, y1 - y0, COLOR_QR_FG);
+    }
+  }
 }
 
 static void fb_draw_arc_segment(int cx, int cy, int inner_r, int outer_r,
@@ -418,7 +782,8 @@ static void draw_hybrid_metric_card(int x, int w, const char *label,
 }
 
 static void draw_hybrid_overlay(const dashboard_state_t *state,
-                                bool wifi_connected) {
+                                bool wifi_connected,
+                                bool provisioning_portal_active) {
   char time_text[16];
   char date_text[16];
   char eco2_text[16];
@@ -469,6 +834,10 @@ static void draw_hybrid_overlay(const dashboard_state_t *state,
     draw_wifi_offline_icon(wifi_cx, wifi_cy, COLOR_MUTED, COLOR_RED);
   }
   fb_draw_text5x7(date_x, 6, date_text, COLOR_YELLOW, 1);
+  if (provisioning_portal_active) {
+    fb_fill_rect(wifi_cx - 11, wifi_cy + 1, 2, 6, COLOR_CYAN);
+    fb_fill_rect(wifi_cx - 11, wifi_cy + 9, 2, 2, COLOR_CYAN);
+  }
 
   {
     const int px = 4, py = 23, pw = 58, ph = 69;
@@ -526,38 +895,35 @@ static void draw_local_header(const char *title, const char *subtitle) {
 
 static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status) {
   char ssid_text[40];
-  char host_text[32];
-  char mode_text[16];
-  char link_text[16];
+  char ip_text[20];
+  char ssid_short[40];
+  char url_text[48];
+  const bool portal_active = wifi_status->provisioning_portal_active;
+  const bool can_open_qr = portal_active || wifi_status->connected;
+  const uint16_t accent = portal_active
+                              ? COLOR_CYAN
+                              : (wifi_status->connected ? COLOR_LIME : COLOR_ORANGE);
 
-  draw_local_header("WIFI CONFIG", "LOCAL PANEL");
+  draw_local_header("WIFI ACCESS", "");
+  fb_fill_rect(104, 8, 44, 10, RGB565(8, 18, 28));
+  fb_draw_rect(104, 8, 44, 10, accent);
+  fb_fill_circle(109, 13, 1, accent);
+  fb_draw_text(114, 11, portal_active ? "PORTAL" : "RUNTIME", accent, 1);
   sanitize_display_text(wifi_status->ssid, ssid_text, sizeof(ssid_text));
-  sanitize_display_text(CONNECTIVITY_RUNTIME_HOSTNAME ".LOCAL", host_text,
-                        sizeof(host_text));
+  sanitize_display_text(wifi_status->runtime_ip, ip_text, sizeof(ip_text));
+  truncate_text_to_width(ssid_text, ssid_short, sizeof(ssid_short), 148, 4);
+  if (!can_open_qr) {
+    url_text[0] = '\0';
+  } else if (strcmp(ip_text, "NO IP") == 0) {
+    sanitize_url_text("http://aqnode.local/", url_text, sizeof(url_text));
+  } else {
+    snprintf(url_text, sizeof(url_text), "http://%s/", wifi_status->runtime_ip);
+    sanitize_url_text(url_text, url_text, sizeof(url_text));
+  }
 
-  strlcpy(mode_text,
-          wifi_status->provisioning_portal_active ? "PORTAL" : "RUNTIME",
-          sizeof(mode_text));
-  strlcpy(link_text, wifi_status->connected ? "ONLINE" : "OFFLINE",
-          sizeof(link_text));
+  draw_qr_block(42, 33, 76, url_text);
 
-  draw_panel(6, 34, 148, 22, COLOR_CYAN);
-  fb_draw_text5x7(12, 40, "SSID", COLOR_MUTED, 1);
-  fb_draw_text5x7(58, 40, ssid_text, COLOR_WHITE, 1);
-
-  draw_panel(6, 60, 148, 22, COLOR_LIME);
-  fb_draw_text5x7(12, 66, "LINK", COLOR_MUTED, 1);
-  fb_draw_text5x7(58, 66, link_text,
-                  wifi_status->connected ? COLOR_LIME : COLOR_ORANGE, 1);
-  fb_draw_text5x7(102, 66, mode_text, COLOR_CYAN, 1);
-
-  draw_panel(6, 86, 148, 18, COLOR_YELLOW);
-  fb_draw_text5x7(12, 91, "HOST", COLOR_MUTED, 1);
-  fb_draw_text5x7(46, 91, host_text, COLOR_WHITE, 1);
-
-  draw_panel(6, 107, 148, 16, COLOR_ORANGE);
-  fb_draw_text5x7(12, 111, "IP", COLOR_MUTED, 1);
-  fb_draw_text5x7(34, 111, wifi_status->runtime_ip, COLOR_WHITE, 1);
+  fb_draw_text5x7_centered(80, 121, ssid_short, RGB565(230, 238, 246), 1);
 }
 
 static void draw_alarm_screen(void) {
@@ -642,7 +1008,8 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
                                    const connectivity_ui_status_t *wifi_status) {
   switch (menu->active_screen) {
   case LOCAL_SCREEN_MONITOR:
-    draw_hybrid_overlay(state, wifi_status->connected);
+    draw_hybrid_overlay(state, wifi_status->connected,
+                        wifi_status->provisioning_portal_active);
     break;
   case LOCAL_SCREEN_WIFI:
     draw_wifi_screen(wifi_status);
@@ -657,7 +1024,8 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
     draw_memory_screen();
     break;
   default:
-    draw_hybrid_overlay(state, wifi_status->connected);
+    draw_hybrid_overlay(state, wifi_status->connected,
+                        wifi_status->provisioning_portal_active);
     break;
   }
 
@@ -763,7 +1131,8 @@ static void draw_aqi_gauge(const dashboard_state_t *state, int cx, int cy) {
 }
 
 void ui_renderer_draw_dashboard(const dashboard_state_t *state,
-                                bool wifi_connected) {
+                                bool wifi_connected,
+                                bool provisioning_portal_active) {
   char time_text[16];
   char date_text[16];
   char co2_text[16];
@@ -801,6 +1170,10 @@ void ui_renderer_draw_dashboard(const dashboard_state_t *state,
     draw_wifi_icon(141, 11, COLOR_LIME);
   } else {
     draw_wifi_offline_icon(141, 11, COLOR_MUTED, COLOR_RED);
+  }
+  if (provisioning_portal_active) {
+    fb_fill_rect(130, 12, 2, 6, COLOR_CYAN);
+    fb_fill_rect(130, 20, 2, 2, COLOR_CYAN);
   }
   draw_aqi_gauge(state, 41, 66);
   fb_draw_text(headline_x, 44, headline, aqi_color(state->aqi), 3);

@@ -4,6 +4,14 @@ const currentSsid = document.getElementById("currentSsid");
 const apInfo = document.getElementById("apInfo");
 const credSource = document.getElementById("credSource");
 const runtimeIp = document.getElementById("runtimeIp");
+const quickSsid = document.getElementById("quickSsid");
+const quickAccessIp = document.getElementById("quickAccessIp");
+const quickAccessLink = document.getElementById("quickAccessLink");
+const qrAccessCard = document.getElementById("qrAccessCard");
+const qrCanvas = document.getElementById("qrCanvas");
+const qrTitle = document.getElementById("qrTitle");
+const qrModeBadge = document.getElementById("qrModeBadge");
+const qrCaption = document.getElementById("qrCaption");
 
 const metricAqi = document.getElementById("metricAqi");
 const metricAqiCard = document.getElementById("metricAqiCard");
@@ -32,6 +40,7 @@ const memorySelection = document.getElementById("memorySelection");
 
 const tabButtons = [...document.querySelectorAll(".tab-btn")];
 const tabPanels = [...document.querySelectorAll(".tab-panel")];
+const langButtons = [...document.querySelectorAll(".lang-btn")];
 
 const disconnectBtn = document.getElementById("disconnectBtn");
 const forgetBtn = document.getElementById("forgetBtn");
@@ -44,9 +53,15 @@ const alarmClearBtn = document.getElementById("alarmClearBtn");
 const alarmInfo = document.getElementById("alarmInfo");
 
 const ALARM_STORAGE_KEY = "aqnode_alarm";
+const LANGUAGE_STORAGE_KEY = "aqnode_lang";
 const MEMORY_WIDTH = 160;
 const MEMORY_HEIGHT = 128;
 const MEMORY_BYTES = MEMORY_WIDTH * MEMORY_HEIGHT * 2;
+const QR_VERSION = 3;
+const QR_SIZE = 29;
+const QR_DATA_CODEWORDS = 55;
+const QR_EC_CODEWORDS = 15;
+const QR_ALIGNMENT_CENTER = 22;
 
 let scanInProgress = false;
 let alarmTimer = null;
@@ -55,6 +70,265 @@ let memoryRgb565Buffer = null;
 let memoryDraftDirty = false;
 let memoryDraft = null;
 let memoryPointerDrag = null;
+let currentLang = localStorage.getItem(LANGUAGE_STORAGE_KEY) === "vi" ? "vi" : "en";
+let lastState = null;
+
+const TEXT = {
+  en: {
+    "brand.eyebrow": "Air Quality Node",
+    "brand.title": "Control Center",
+    "tab.monitoring": "Monitoring",
+    "tab.wifi": "Wi-Fi Config",
+    "tab.memory": "Memory",
+    "tab.alarm": "Alarm",
+    "meta.mode": "Mode",
+    "meta.network": "Network",
+    "meta.access": "Access",
+    "monitoring.title": "Live Monitoring",
+    "monitoring.hint": "Realtime values from the running device.",
+    "monitoring.note": "Primary comfort signal for the room right now.",
+    "wifi.title": "Connect Device to Wi-Fi",
+    "wifi.hint": "Use the setup hotspot, choose a Wi-Fi network, then let the device join it.",
+    "wifi.step1.title": "Open setup",
+    "wifi.step1.body": "Connect to the device hotspot or tap the setup button below.",
+    "wifi.step2.title": "Choose Wi-Fi",
+    "wifi.step2.body": "Pick your home or office Wi-Fi, then enter the password if needed.",
+    "wifi.step3.title": "Finish",
+    "wifi.step3.body": "The device will connect and return to normal mode automatically.",
+    "wifi.shortcut.kicker": "Setup Shortcut",
+    "wifi.shortcut.title": "Scan this to open the device setup page",
+    "wifi.shortcut.body": "If setup mode is active, your phone can scan this QR and open the right page instantly.",
+    "wifi.shortcut.hotspot": "Device hotspot",
+    "wifi.shortcut.address": "Open address",
+    "wifi.shortcut.link": "Direct link",
+    "wifi.qr.kicker": "Phone Access",
+    "wifi.meta.current": "Current Wi-Fi",
+    "wifi.meta.hotspot": "Setup hotspot",
+    "wifi.meta.saved": "Saved settings",
+    "wifi.scan.title": "Choose a Wi-Fi network",
+    "wifi.scan.portal": "Open Setup Hotspot",
+    "wifi.scan.find": "Find Wi-Fi",
+    "wifi.scan.hint": "Tap a network below to fill in the name automatically.",
+    "wifi.form.title": "Enter Wi-Fi details",
+    "wifi.form.name": "Wi-Fi name",
+    "wifi.form.password": "Password",
+    "wifi.form.hidden": "This Wi-Fi is hidden",
+    "wifi.form.hint": "Leave the password empty only if this Wi-Fi does not require one.",
+    "wifi.form.submit": "Connect Device",
+    "wifi.actions.title": "Advanced Actions",
+    "wifi.actions.disconnect": "Disconnect and Open Setup",
+    "wifi.actions.forget": "Erase Saved Wi-Fi",
+    "wifi.actions.stop": "Close Setup Hotspot",
+    "alarm.title": "Alarm Scheduler",
+    "alarm.hint": "Set quick reminders in the web console (local browser storage).",
+    "alarm.time": "Alarm Time",
+    "alarm.message": "Message",
+    "alarm.placeholder": "Check sensor and filters",
+    "alarm.save": "Save Alarm",
+    "alarm.clear": "Clear",
+    "badge.loading": "Loading",
+    "badge.checking": "Checking",
+    "badge.provisioning": "Provisioning",
+    "badge.runtime": "Runtime",
+    "badge.connected": "Wi-Fi Connected",
+    "badge.offline": "Offline",
+    "badge.setupReady": "Setup Ready",
+    "badge.directLink": "Direct Link",
+    "label.none": "(none)",
+    "label.notSet": "Not set yet",
+    "label.savedOnDevice": "Saved on this device",
+    "label.firmwareDefault": "Using default firmware setting",
+    "label.password": "Password",
+    "label.provisioningQr": "Provisioning QR",
+    "label.runtimeQr": "Runtime QR",
+    "label.waiting": "Waiting",
+    "qr.empty": "No scannable local address yet. Start provisioning or wait for Wi-Fi IP.",
+    "qr.aria": "QR code to open local Air Quality portal",
+    "qr.caption.provisioning": "Connect your phone to the device hotspot, then scan this QR to open setup.",
+    "qr.caption.runtime": "If your phone is on the same network, this QR opens the device page directly.",
+    "aqi.waiting": "Waiting",
+    "aqi.l1": "Level 1 · Excellent",
+    "aqi.l2": "Level 2 · Good",
+    "aqi.l3": "Level 3 · Moderate",
+    "aqi.l4": "Level 4 · Poor",
+    "aqi.l5": "Level 5 · Unhealthy",
+    "status.uiMismatch": "UI mismatch ({items}). Please hard refresh page (Ctrl+F5).",
+    "status.scanEmpty": "No Wi-Fi networks were found nearby. Try again from a closer spot.",
+    "status.networkSecure": "Password required · Signal {rssi} dBm",
+    "status.networkOpen": "No password needed · Signal {rssi} dBm",
+    "status.secure": "Secure",
+    "status.open": "Open",
+    "status.selectedWifi": "Selected Wi-Fi: {ssid}",
+    "status.scanning": "Looking for nearby Wi-Fi networks...",
+    "status.scanFound": "Found {count} Wi-Fi networks.",
+    "status.enterWifiName": "Please enter the Wi-Fi name.",
+    "status.testingWifi": "Trying this Wi-Fi on the device. This can take a few seconds...",
+    "status.connectedSaved": "Connected! Credentials saved.",
+    "status.requestTimedOut": "Request timed out. The device may still be testing.",
+    "status.enablePortal": "Enabling setup hotspot...",
+    "status.portalActive": "Setup hotspot is active.",
+    "status.disconnectingWifi": "Disconnecting Wi-Fi...",
+    "status.wifiDisconnected": "Wi-Fi disconnected.",
+    "status.eraseConfirm": "Erase saved Wi-Fi credentials from device? You will need to re-enter them.",
+    "status.erasingCredentials": "Erasing credentials...",
+    "status.credentialsErased": "Credentials erased.",
+    "status.stoppingPortal": "Stopping provisioning portal...",
+    "status.provisioningStopped": "Provisioning stopped.",
+    "status.noAlarm": "No alarm configured.",
+    "status.noImageSelected": "No image selected.",
+    "status.alarmSet": "Alarm set at {time} - {message}",
+    "status.noMessage": "No message",
+    "status.alarmAlert": "AQ Node Alarm: {message}",
+    "status.checkDevice": "Time to check your device.",
+    "status.setAlarmFirst": "Please set alarm time first.",
+    "status.alarmSaved": "Alarm saved on this browser.",
+    "status.alarmCleared": "Alarm cleared.",
+    "status.dashboardReady": "Dashboard ready.",
+    "status.bootFailed": "Boot failed: {message}",
+  },
+  vi: {
+    "brand.eyebrow": "Thiet bi khong khi",
+    "brand.title": "Trung tâm điều khiển",
+    "tab.monitoring": "Theo dõi",
+    "tab.wifi": "Cài Wi-Fi",
+    "tab.memory": "Kỷ niệm",
+    "tab.alarm": "Báo thức",
+    "meta.mode": "Chế độ",
+    "meta.network": "Kết nối",
+    "meta.access": "Truy cập",
+    "monitoring.title": "Giám sát trực tiếp",
+    "monitoring.hint": "Các giá trị đang chạy theo thời gian thực từ thiết bị.",
+    "monitoring.note": "Chỉ số dễ nhìn nhất để biết chất lượng không khí hiện tại.",
+    "wifi.title": "Kết nối thiết bị vào Wi-Fi",
+    "wifi.hint": "Mở hotspot cài đặt, chọn mạng Wi‑Fi, rồi để thiết bị tự kết nối.",
+    "wifi.step1.title": "Mở cài đặt",
+    "wifi.step1.body": "Kết nối vào hotspot của thiết bị hoặc bấm nút mở cài đặt bên dưới.",
+    "wifi.step2.title": "Chọn Wi‑Fi",
+    "wifi.step2.body": "Chọn Wi‑Fi ở nhà hoặc văn phòng, rồi nhập mật khẩu nếu cần.",
+    "wifi.step3.title": "Hoàn tất",
+    "wifi.step3.body": "Thiết bị sẽ tự kết nối và quay lại chế độ bình thường.",
+    "wifi.shortcut.kicker": "Lối vào nhanh",
+    "wifi.shortcut.title": "Quét mã để mở trang cài đặt thiết bị",
+    "wifi.shortcut.body": "Nếu chế độ cài đặt đang bật, điện thoại có thể quét QR này để vào đúng trang ngay.",
+    "wifi.shortcut.hotspot": "Hotspot thiết bị",
+    "wifi.shortcut.address": "Địa chỉ mở",
+    "wifi.shortcut.link": "Liên kết trực tiếp",
+    "wifi.qr.kicker": "Mở bằng điện thoại",
+    "wifi.meta.current": "Wi‑Fi hiện tại",
+    "wifi.meta.hotspot": "Hotspot cài đặt",
+    "wifi.meta.saved": "Thiết lập đã lưu",
+    "wifi.scan.title": "Chọn một mạng Wi‑Fi",
+    "wifi.scan.portal": "Mở Hotspot Cài Đặt",
+    "wifi.scan.find": "Tìm Wi‑Fi",
+    "wifi.scan.hint": "Chạm vào một mạng bên dưới để tự điền tên.",
+    "wifi.form.title": "Nhập thông tin Wi‑Fi",
+    "wifi.form.name": "Tên Wi‑Fi",
+    "wifi.form.password": "Mật khẩu",
+    "wifi.form.hidden": "Wi‑Fi này đang ẩn",
+    "wifi.form.hint": "Chỉ để trống mật khẩu nếu Wi‑Fi này không cần mật khẩu.",
+    "wifi.form.submit": "Kết nối thiết bị",
+    "wifi.actions.title": "Tác vụ nâng cao",
+    "wifi.actions.disconnect": "Ngắt Wi‑Fi và mở cài đặt",
+    "wifi.actions.forget": "Xóa Wi‑Fi đã lưu",
+    "wifi.actions.stop": "Đóng hotspot cài đặt",
+    "alarm.title": "Hẹn giờ báo thức",
+    "alarm.hint": "Tạo nhắc nhở nhanh trên web này (lưu trong trình duyệt).",
+    "alarm.time": "Giờ báo thức",
+    "alarm.message": "Lời nhắc",
+    "alarm.placeholder": "Kiểm tra cảm biến và bộ lọc",
+    "alarm.save": "Lưu báo thức",
+    "alarm.clear": "Xóa",
+    "badge.loading": "Đang tải",
+    "badge.checking": "Đang kiểm tra",
+    "badge.provisioning": "Cài đặt",
+    "badge.runtime": "Hoạt động",
+    "badge.connected": "Đã nối Wi‑Fi",
+    "badge.offline": "Ngoại tuyến",
+    "badge.setupReady": "Sẵn sàng cài đặt",
+    "badge.directLink": "Mở trực tiếp",
+    "label.none": "(chưa có)",
+    "label.notSet": "Chưa có",
+    "label.savedOnDevice": "Đã lưu trên thiết bị",
+    "label.firmwareDefault": "Đang dùng thiết lập mặc định của firmware",
+    "label.password": "Mật khẩu",
+    "label.provisioningQr": "QR cài đặt",
+    "label.runtimeQr": "QR truy cập",
+    "label.waiting": "Đang chờ",
+    "qr.empty": "Chưa có địa chỉ để quét. Hãy bật chế độ cài đặt hoặc chờ thiết bị nhận IP Wi‑Fi.",
+    "qr.aria": "Mã QR để mở trang cục bộ của Air Quality",
+    "qr.caption.provisioning": "Kết nối điện thoại vào hotspot của thiết bị rồi quét QR này để mở phần cài đặt.",
+    "qr.caption.runtime": "Nếu điện thoại cùng mạng với thiết bị, QR này sẽ mở trang thiết bị trực tiếp.",
+    "aqi.waiting": "Đang chờ",
+    "aqi.l1": "Mức 1 · Rất tốt",
+    "aqi.l2": "Mức 2 · Tốt",
+    "aqi.l3": "Mức 3 · Trung bình",
+    "aqi.l4": "Mức 4 · Kém",
+    "aqi.l5": "Mức 5 · Không tốt",
+    "status.uiMismatch": "UI chưa khớp ({items}). Hãy hard refresh trang (Ctrl+F5).",
+    "status.scanEmpty": "Không tìm thấy mạng Wi‑Fi nào gần đây. Hãy thử lại khi ở gần thiết bị hơn.",
+    "status.networkSecure": "Cần mật khẩu · Tín hiệu {rssi} dBm",
+    "status.networkOpen": "Không cần mật khẩu · Tín hiệu {rssi} dBm",
+    "status.secure": "Có khóa",
+    "status.open": "Mở",
+    "status.selectedWifi": "Đã chọn Wi‑Fi: {ssid}",
+    "status.scanning": "Đang tìm các mạng Wi‑Fi gần đây...",
+    "status.scanFound": "Đã tìm thấy {count} mạng Wi‑Fi.",
+    "status.enterWifiName": "Vui lòng nhập tên Wi‑Fi.",
+    "status.testingWifi": "Thiết bị đang thử kết nối Wi‑Fi này. Quá trình này có thể mất vài giây...",
+    "status.connectedSaved": "Đã kết nối! Thông tin đã được lưu.",
+    "status.requestTimedOut": "Yêu cầu đã hết thời gian chờ. Thiết bị có thể vẫn đang kiểm tra.",
+    "status.enablePortal": "Đang bật hotspot cài đặt...",
+    "status.portalActive": "Hotspot cài đặt đang hoạt động.",
+    "status.disconnectingWifi": "Đang ngắt Wi‑Fi...",
+    "status.wifiDisconnected": "Đã ngắt Wi‑Fi.",
+    "status.eraseConfirm": "Xóa Wi‑Fi đã lưu khỏi thiết bị nhé? Sau đó sẽ cần nhập lại.",
+    "status.erasingCredentials": "Đang xóa thông tin đã lưu...",
+    "status.credentialsErased": "Đã xóa thông tin Wi‑Fi.",
+    "status.stoppingPortal": "Đang tắt cổng cài đặt...",
+    "status.provisioningStopped": "Đã tắt chế độ cài đặt.",
+    "status.noAlarm": "Chưa có báo thức nào.",
+    "status.noImageSelected": "Chưa chọn ảnh nào.",
+    "status.alarmSet": "Báo thức lúc {time} - {message}",
+    "status.noMessage": "Không có lời nhắc",
+    "status.alarmAlert": "Báo thức AQ Node: {message}",
+    "status.checkDevice": "Đến giờ kiểm tra thiết bị rồi.",
+    "status.setAlarmFirst": "Vui lòng chọn giờ báo thức trước.",
+    "status.alarmSaved": "Đã lưu báo thức trên trình duyệt này.",
+    "status.alarmCleared": "Đã xóa báo thức.",
+    "status.dashboardReady": "Bảng điều khiển đã sẵn sàng.",
+    "status.bootFailed": "Khởi động thất bại: {message}",
+  },
+};
+
+function t(key, vars = {}) {
+  const template = TEXT[currentLang]?.[key] ?? TEXT.en[key] ?? key;
+  return template.replace(/\{(\w+)\}/g, (_, name) => `${vars[name] ?? ""}`);
+}
+
+function setLanguage(lang) {
+  currentLang = lang === "vi" ? "vi" : "en";
+  localStorage.setItem(LANGUAGE_STORAGE_KEY, currentLang);
+  document.documentElement.lang = currentLang;
+  langButtons.forEach((button) => {
+    button.classList.toggle("active", button.dataset.lang === currentLang);
+  });
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    el.setAttribute("placeholder", t(el.dataset.i18nPlaceholder));
+  });
+  if (!lastState) {
+    setBadge(modeBadge, t("badge.loading"));
+    setBadge(linkBadge, t("badge.checking"), "muted");
+    metricAqiState.textContent = t("label.waiting");
+    qrModeBadge.textContent = t("label.waiting");
+  }
+  renderAlarm();
+  if (lastState) {
+    renderState(lastState);
+  }
+}
 
 function markWifiFormDirty() {
   wifiFormDirty = true;
@@ -79,9 +353,264 @@ function setBadge(el, text, variant = "") {
 }
 
 function formatSource(source) {
-  if (source === "nvs") return "Saved in device (NVS)";
-  if (source === "build") return "Firmware fallback";
-  return "Not configured";
+  if (source === "nvs") return t("label.savedOnDevice");
+  if (source === "build") return t("label.firmwareDefault");
+  return t("label.notSet");
+}
+
+function initQrMath() {
+  const exp = new Array(512).fill(0);
+  const log = new Array(256).fill(0);
+  let value = 1;
+
+  for (let i = 0; i < 255; i += 1) {
+    exp[i] = value;
+    log[value] = i;
+    value <<= 1;
+    if (value & 0x100) {
+      value ^= 0x11d;
+    }
+  }
+
+  for (let i = 255; i < 512; i += 1) {
+    exp[i] = exp[i - 255];
+  }
+
+  return { exp, log };
+}
+
+const QR_GF = initQrMath();
+
+function gfMul(a, b) {
+  if (a === 0 || b === 0) {
+    return 0;
+  }
+  return QR_GF.exp[QR_GF.log[a] + QR_GF.log[b]];
+}
+
+function buildGeneratorPoly(degree) {
+  let poly = [1];
+
+  for (let i = 0; i < degree; i += 1) {
+    const next = new Array(poly.length + 1).fill(0);
+    for (let j = 0; j < poly.length; j += 1) {
+      next[j] ^= poly[j];
+      next[j + 1] ^= gfMul(poly[j], QR_GF.exp[i]);
+    }
+    poly = next;
+  }
+
+  return poly;
+}
+
+const QR_GENERATOR = buildGeneratorPoly(QR_EC_CODEWORDS);
+
+function buildQrCodewords(text) {
+  const bytes = [...new TextEncoder().encode(text)];
+  if (bytes.length > 53) {
+    return null;
+  }
+
+  const bits = [];
+  const pushBits = (value, width) => {
+    for (let bit = width - 1; bit >= 0; bit -= 1) {
+      bits.push((value >> bit) & 1);
+    }
+  };
+
+  pushBits(0b0100, 4);
+  pushBits(bytes.length, 8);
+  bytes.forEach((byte) => pushBits(byte, 8));
+
+  const maxBits = QR_DATA_CODEWORDS * 8;
+  const terminatorBits = Math.min(4, maxBits - bits.length);
+  for (let i = 0; i < terminatorBits; i += 1) {
+    bits.push(0);
+  }
+  while (bits.length % 8 !== 0) {
+    bits.push(0);
+  }
+
+  const data = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let byte = 0;
+    for (let bit = 0; bit < 8; bit += 1) {
+      byte = (byte << 1) | bits[i + bit];
+    }
+    data.push(byte);
+  }
+
+  const pads = [0xec, 0x11];
+  while (data.length < QR_DATA_CODEWORDS) {
+    data.push(pads[data.length % 2]);
+  }
+
+  const ec = new Array(QR_EC_CODEWORDS).fill(0);
+  data.forEach((byte) => {
+    const factor = byte ^ ec[0];
+    ec.shift();
+    ec.push(0);
+    if (factor === 0) {
+      return;
+    }
+    for (let i = 0; i < QR_EC_CODEWORDS; i += 1) {
+      ec[i] ^= gfMul(QR_GENERATOR[i + 1], factor);
+    }
+  });
+
+  return [...data, ...ec];
+}
+
+function createQrMatrix(text) {
+  const codewords = buildQrCodewords(text);
+  if (!codewords) {
+    return null;
+  }
+
+  const size = QR_SIZE;
+  const modules = Array.from({ length: size }, () => Array(size).fill(false));
+  const assigned = Array.from({ length: size }, () => Array(size).fill(false));
+  const setModule = (x, y, value) => {
+    modules[y][x] = Boolean(value);
+    assigned[y][x] = true;
+  };
+  const reserveModule = (x, y, value = false) => {
+    if (!assigned[y][x]) {
+      modules[y][x] = Boolean(value);
+      assigned[y][x] = true;
+    }
+  };
+  const drawFinder = (left, top) => {
+    for (let y = -1; y <= 7; y += 1) {
+      for (let x = -1; x <= 7; x += 1) {
+        const xx = left + x;
+        const yy = top + y;
+        if (xx < 0 || yy < 0 || xx >= size || yy >= size) {
+          continue;
+        }
+        const outer = x >= 0 && x <= 6 && y >= 0 && y <= 6;
+        const border = x === 0 || x === 6 || y === 0 || y === 6;
+        const inner = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+        setModule(xx, yy, outer && (border || inner));
+      }
+    }
+  };
+  const drawAlignment = (centerX, centerY) => {
+    for (let y = -2; y <= 2; y += 1) {
+      for (let x = -2; x <= 2; x += 1) {
+        const xx = centerX + x;
+        const yy = centerY + y;
+        const distance = Math.max(Math.abs(x), Math.abs(y));
+        setModule(xx, yy, distance !== 1);
+      }
+    }
+  };
+
+  drawFinder(0, 0);
+  drawFinder(size - 7, 0);
+  drawFinder(0, size - 7);
+  drawAlignment(QR_ALIGNMENT_CENTER, QR_ALIGNMENT_CENTER);
+
+  for (let i = 8; i < size - 8; i += 1) {
+    setModule(i, 6, i % 2 === 0);
+    setModule(6, i, i % 2 === 0);
+  }
+  setModule(8, (4 * QR_VERSION) + 9, true);
+
+  for (let i = 0; i < 9; i += 1) {
+    if (i !== 6) {
+      reserveModule(8, i);
+      reserveModule(i, 8);
+    }
+  }
+  for (let i = 0; i < 8; i += 1) {
+    reserveModule(size - 1 - i, 8);
+    reserveModule(8, size - 1 - i);
+  }
+
+  const bitStream = [];
+  codewords.forEach((codeword) => {
+    for (let bit = 7; bit >= 0; bit -= 1) {
+      bitStream.push((codeword >> bit) & 1);
+    }
+  });
+
+  let bitIndex = 0;
+  let direction = -1;
+  for (let x = size - 1; x > 0; x -= 2) {
+    if (x === 6) {
+      x -= 1;
+    }
+    for (let step = 0; step < size; step += 1) {
+      const y = direction === -1 ? size - 1 - step : step;
+      for (let dx = 0; dx < 2; dx += 1) {
+        const xx = x - dx;
+        if (assigned[y][xx]) {
+          continue;
+        }
+        let value = bitStream[bitIndex] === 1;
+        bitIndex += 1;
+        if ((xx + y) % 2 === 0) {
+          value = !value;
+        }
+        modules[y][xx] = value;
+        assigned[y][xx] = true;
+      }
+    }
+    direction *= -1;
+  }
+
+  const formatData = (0b01 << 3) | 0;
+  let remainder = formatData << 10;
+  while (remainder >= (1 << 10)) {
+    const shift = Math.floor(Math.log2(remainder)) - 10;
+    remainder ^= 0x537 << shift;
+  }
+  const format = ((formatData << 10) | remainder) ^ 0x5412;
+  for (let i = 0; i <= 5; i += 1) {
+    modules[i][8] = ((format >> i) & 1) === 1;
+  }
+  modules[7][8] = ((format >> 6) & 1) === 1;
+  modules[8][8] = ((format >> 7) & 1) === 1;
+  modules[8][7] = ((format >> 8) & 1) === 1;
+  for (let i = 9; i < 15; i += 1) {
+    modules[8][14 - i] = ((format >> i) & 1) === 1;
+  }
+
+  for (let i = 0; i < 8; i += 1) {
+    modules[8][size - 1 - i] = ((format >> i) & 1) === 1;
+  }
+  for (let i = 8; i < 15; i += 1) {
+    modules[size - 15 + i][8] = ((format >> i) & 1) === 1;
+  }
+
+  return modules;
+}
+
+function renderQrCode(target, text) {
+  if (!target) {
+    return false;
+  }
+
+  const matrix = text ? createQrMatrix(text) : null;
+  if (!matrix) {
+    target.innerHTML = `<div class="wifi-qr-empty">${t("qr.empty")}</div>`;
+    return false;
+  }
+
+  const quietZone = 4;
+  const viewSize = matrix.length + (quietZone * 2);
+  const rects = [];
+  for (let y = 0; y < matrix.length; y += 1) {
+    for (let x = 0; x < matrix.length; x += 1) {
+      if (matrix[y][x]) {
+        rects.push(`<rect x="${x + quietZone}" y="${y + quietZone}" width="1" height="1"/>`);
+      }
+    }
+  }
+
+  target.innerHTML = `<svg viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="${t("qr.aria")}" xmlns="http://www.w3.org/2000/svg"><rect width="${viewSize}" height="${viewSize}" fill="#ffffff"/><g fill="#061321">${rects.join("")}</g></svg>`;
+  return true;
 }
 
 function ensureUiBindings() {
@@ -93,6 +622,14 @@ function ensureUiBindings() {
     [apInfo, "apInfo"],
     [credSource, "credSource"],
     [runtimeIp, "runtimeIp"],
+    [quickSsid, "quickSsid"],
+    [quickAccessIp, "quickAccessIp"],
+    [quickAccessLink, "quickAccessLink"],
+    [qrAccessCard, "qrAccessCard"],
+    [qrCanvas, "qrCanvas"],
+    [qrTitle, "qrTitle"],
+    [qrModeBadge, "qrModeBadge"],
+    [qrCaption, "qrCaption"],
     [metricAqi, "metricAqi"],
     [metricAqiCard, "metricAqiCard"],
     [metricAqiState, "metricAqiState"],
@@ -131,7 +668,7 @@ function ensureUiBindings() {
   });
 
   if (missing.length > 0) {
-    setStatus(`UI mismatch (${missing.join(", ")}). Please hard refresh page (Ctrl+F5).`, "bad");
+    setStatus(t("status.uiMismatch", { items: missing.join(", ") }), "bad");
     return false;
   }
   return true;
@@ -156,15 +693,15 @@ async function fetchJson(url, options) {
 
 function describeAqi(aqi) {
   if (aqi == null || Number.isNaN(Number(aqi))) {
-    return { label: "Waiting", tone: "idle" };
+    return { label: t("aqi.waiting"), tone: "idle" };
   }
 
   const level = Number(aqi);
-  if (level <= 1) return { label: "Level 1 · Excellent", tone: "good" };
-  if (level === 2) return { label: "Level 2 · Good", tone: "good" };
-  if (level === 3) return { label: "Level 3 · Moderate", tone: "mid" };
-  if (level === 4) return { label: "Level 4 · Poor", tone: "warn" };
-  return { label: "Level 5 · Unhealthy", tone: "bad" };
+  if (level <= 1) return { label: t("aqi.l1"), tone: "good" };
+  if (level === 2) return { label: t("aqi.l2"), tone: "good" };
+  if (level === 3) return { label: t("aqi.l3"), tone: "mid" };
+  if (level === 4) return { label: t("aqi.l4"), tone: "warn" };
+  return { label: t("aqi.l5"), tone: "bad" };
 }
 
 function switchTab(tabName) {
@@ -188,20 +725,44 @@ function switchTab(tabName) {
 
 async function loadState() {
   const state = await fetchJson("/api/state");
-  setBadge(modeBadge, state.mode === "provisioning" ? "Provisioning" : "Runtime");
-  setBadge(linkBadge, state.connected ? "Wi-Fi Connected" : "Offline", state.connected ? "ok" : "warn");
+  lastState = state;
+  renderState(state);
+}
 
-  currentSsid.textContent = state.currentSsid || "(none)";
-  apInfo.textContent = `${state.apSsid || "-"} / ${state.apPassword || "-"}`;
+function renderState(state) {
+  setBadge(modeBadge, state.mode === "provisioning" ? t("badge.provisioning") : t("badge.runtime"));
+  setBadge(linkBadge, state.connected ? t("badge.connected") : t("badge.offline"), state.connected ? "ok" : "warn");
+
+  currentSsid.textContent = state.currentSsid || t("label.none");
+  apInfo.textContent = state.apSsid
+    ? `${state.apSsid} · ${t("label.password")}: ${state.apPassword || "-"}`
+    : "-";
   credSource.textContent = formatSource(state.credentialSource);
+  quickSsid.textContent = state.provisioning ? (state.apSsid || "-") : (state.currentSsid || t("label.none"));
+  quickAccessIp.textContent = state.accessIp || state.runtimeIp || state.apIp || "-";
 
-  if (state.runtimeHost) {
+  if (state.accessUrl) {
+    runtimeIp.textContent = state.accessUrl;
+  } else if (state.runtimeHost) {
     runtimeIp.textContent = `http://${state.runtimeHost}`;
   } else if (state.runtimeIp) {
     runtimeIp.textContent = `http://${state.runtimeIp}`;
   } else {
     runtimeIp.textContent = "-";
   }
+
+  const accessUrl = state.accessUrl || "";
+  quickAccessLink.textContent = accessUrl || "-";
+  if (accessUrl) {
+    quickAccessLink.href = accessUrl;
+  } else {
+    quickAccessLink.removeAttribute("href");
+  }
+  quickAccessLink.tabIndex = accessUrl ? 0 : -1;
+  qrTitle.textContent = state.provisioning ? t("label.provisioningQr") : t("label.runtimeQr");
+  setBadge(qrModeBadge, state.provisioning ? t("badge.setupReady") : t("badge.directLink"), state.provisioning ? "ok" : "muted");
+  qrCaption.textContent = state.provisioning ? t("qr.caption.provisioning") : t("qr.caption.runtime");
+  renderQrCode(qrCanvas, accessUrl);
 
   enablePortalBtn.disabled = !state.canStartPortal;
 
@@ -226,7 +787,7 @@ async function loadTelemetry() {
     metricHumidity.textContent = telemetry.humidity != null ? `${telemetry.humidity}%` : "-";
   } catch {
     metricAqi.textContent = "-";
-    metricAqiState.textContent = "Waiting";
+    metricAqiState.textContent = t("label.waiting");
     metricAqiCard.dataset.tone = "idle";
     metricEco2.textContent = "-";
     metricTvoc.textContent = "-";
@@ -510,7 +1071,7 @@ function renderNetworks(items) {
   if (!items || items.length === 0) {
     const empty = document.createElement("p");
     empty.className = "hint";
-    empty.textContent = "No visible Wi-Fi found. Try moving closer and scan again.";
+    empty.textContent = t("status.scanEmpty");
     scanList.appendChild(empty);
     return;
   }
@@ -529,11 +1090,13 @@ function renderNetworks(items) {
 
     const meta = document.createElement("span");
     meta.className = "scan-meta";
-    meta.textContent = `${item.auth} | RSSI ${item.rssi} dBm`;
+    meta.textContent = item.secure
+      ? t("status.networkSecure", { rssi: item.rssi })
+      : t("status.networkOpen", { rssi: item.rssi });
 
     const secure = document.createElement("span");
     secure.className = "scan-meta";
-    secure.textContent = item.secure ? "Locked" : "Open";
+    secure.textContent = item.secure ? t("status.secure") : t("status.open");
 
     left.appendChild(ssid);
     left.appendChild(meta);
@@ -547,7 +1110,7 @@ function renderNetworks(items) {
         passwordInput.value = "";
       }
       markWifiFormDirty();
-      setStatus(`Selected network: ${item.ssid}`, "ok");
+      setStatus(t("status.selectedWifi", { ssid: item.ssid }), "ok");
     });
 
     scanList.appendChild(button);
@@ -559,12 +1122,12 @@ async function scanWifi() {
 
   scanInProgress = true;
   scanBtn.disabled = true;
-  setStatus("Scanning nearby Wi-Fi...", "warn");
+  setStatus(t("status.scanning"), "warn");
 
   try {
     const result = await fetchJson("/api/scan");
     renderNetworks(result.items || []);
-    setStatus(`Found ${result.count ?? 0} networks.`, "ok");
+    setStatus(t("status.scanFound", { count: result.count ?? 0 }), "ok");
   } catch (error) {
     setStatus(error.message, "bad");
   } finally {
@@ -585,11 +1148,14 @@ function parseAlarm() {
 function renderAlarm() {
   const alarm = parseAlarm();
   if (!alarm) {
-    alarmInfo.textContent = "No alarm configured.";
+    alarmInfo.textContent = t("status.noAlarm");
     return;
   }
 
-  alarmInfo.textContent = `Alarm set at ${alarm.time} - ${alarm.message || "No message"}`;
+  alarmInfo.textContent = t("status.alarmSet", {
+    time: alarm.time,
+    message: alarm.message || t("status.noMessage"),
+  });
   alarmTime.value = alarm.time || "";
   alarmMessage.value = alarm.message || "";
 }
@@ -611,7 +1177,7 @@ function scheduleAlarmCheck() {
     const current = `${hh}:${mm}`;
 
     if (current === alarm.time && !alarm.firedAt) {
-      alert(`AQ Node Alarm: ${alarm.message || "Time to check your device."}`);
+      alert(t("status.alarmAlert", { message: alarm.message || t("status.checkDevice") }));
       localStorage.setItem(ALARM_STORAGE_KEY, JSON.stringify({ ...alarm, firedAt: Date.now() }));
       renderAlarm();
     }
@@ -626,6 +1192,12 @@ function scheduleAlarmCheck() {
 }
 
 function bindUiEvents() {
+  langButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      setLanguage(button.dataset.lang);
+    });
+  });
+
   tabButtons.forEach((btn) => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
@@ -642,12 +1214,12 @@ function bindUiEvents() {
     const hidden = hiddenInput.checked;
 
     if (!ssid) {
-      setStatus("SSID cannot be empty.", "bad");
+      setStatus(t("status.enterWifiName"), "bad");
       return;
     }
 
     saveBtn.disabled = true;
-    setStatus("Testing Wi-Fi connection (up to 15s)...", "warn");
+    setStatus(t("status.testingWifi"), "warn");
 
     try {
       const body = new URLSearchParams();
@@ -674,7 +1246,7 @@ function bindUiEvents() {
         clearTimeout(timeout);
       }
 
-      const message = result.message || "Connected! Credentials saved.";
+      const message = result.message || t("status.connectedSaved");
       resetWifiFormDirty();
       setStatus(message, "ok");
       if (!message.toLowerCase().includes("restart")) {
@@ -682,7 +1254,7 @@ function bindUiEvents() {
       }
     } catch (error) {
       if (error.name === "AbortError") {
-        setStatus("Request timed out. The device may still be testing.", "bad");
+        setStatus(t("status.requestTimedOut"), "bad");
       } else {
         setStatus(error.message, "bad");
       }
@@ -705,7 +1277,7 @@ function bindUiEvents() {
       memoryRgb565Buffer = null;
       memoryDraftDirty = false;
       drawMemoryPlaceholder();
-      setMemorySelection("No image selected.");
+      setMemorySelection(t("status.noImageSelected"));
       setMemoryStatus(error.message || "Failed to prepare image.", "bad");
     }
   });
@@ -749,13 +1321,13 @@ function bindUiEvents() {
 
   enablePortalBtn.addEventListener("click", async () => {
     enablePortalBtn.disabled = true;
-    setStatus("Enabling setup hotspot...", "warn");
+    setStatus(t("status.enablePortal"), "warn");
 
     try {
       const result = await fetchJson("/api/provisioning/start", {
         method: "POST",
       });
-      setStatus(result.message || "Setup hotspot is active.", "ok");
+      setStatus(result.message || t("status.portalActive"), "ok");
       await loadState();
     } catch (error) {
       setStatus(error.message, "bad");
@@ -766,10 +1338,10 @@ function bindUiEvents() {
 
   disconnectBtn.addEventListener("click", async () => {
     disconnectBtn.disabled = true;
-    setStatus("Disconnecting Wi-Fi...", "warn");
+    setStatus(t("status.disconnectingWifi"), "warn");
     try {
       const result = await fetchJson("/api/wifi/disconnect", { method: "POST" });
-      setStatus(result.message || "Wi-Fi disconnected.", "ok");
+      setStatus(result.message || t("status.wifiDisconnected"), "ok");
     } catch (error) {
       setStatus(error.message, "bad");
     } finally {
@@ -779,12 +1351,12 @@ function bindUiEvents() {
   });
 
   forgetBtn.addEventListener("click", async () => {
-    if (!confirm("Erase saved Wi-Fi credentials from device? You will need to re-enter them.")) return;
+    if (!confirm(t("status.eraseConfirm"))) return;
     forgetBtn.disabled = true;
-    setStatus("Erasing credentials...", "warn");
+    setStatus(t("status.erasingCredentials"), "warn");
     try {
       const result = await fetchJson("/api/wifi/forget", { method: "POST" });
-      setStatus(result.message || "Credentials erased.", "ok");
+      setStatus(result.message || t("status.credentialsErased"), "ok");
     } catch (error) {
       setStatus(error.message, "bad");
     } finally {
@@ -795,10 +1367,10 @@ function bindUiEvents() {
 
   stopPortalBtn.addEventListener("click", async () => {
     stopPortalBtn.disabled = true;
-    setStatus("Stopping provisioning portal...", "warn");
+    setStatus(t("status.stoppingPortal"), "warn");
     try {
       const result = await fetchJson("/api/provisioning/stop", { method: "POST" });
-      setStatus(result.message || "Provisioning stopped.", "ok");
+      setStatus(result.message || t("status.provisioningStopped"), "ok");
     } catch (error) {
       setStatus(error.message, "bad");
     } finally {
@@ -812,7 +1384,7 @@ function bindUiEvents() {
     const message = alarmMessage.value.trim();
 
     if (!time) {
-      setStatus("Please set alarm time first.", "bad");
+      setStatus(t("status.setAlarmFirst"), "bad");
       return;
     }
 
@@ -824,7 +1396,7 @@ function bindUiEvents() {
       })
     );
     renderAlarm();
-    setStatus("Alarm saved on this browser.", "ok");
+    setStatus(t("status.alarmSaved"), "ok");
   });
 
   alarmClearBtn.addEventListener("click", () => {
@@ -832,7 +1404,7 @@ function bindUiEvents() {
     alarmTime.value = "";
     alarmMessage.value = "";
     renderAlarm();
-    setStatus("Alarm cleared.", "ok");
+    setStatus(t("status.alarmCleared"), "ok");
   });
 }
 
@@ -841,6 +1413,7 @@ async function boot() {
     return;
   }
 
+  setLanguage(currentLang);
   bindUiEvents();
   renderAlarm();
   scheduleAlarmCheck();
@@ -852,7 +1425,7 @@ async function boot() {
     setStatus(error.message, "bad");
   }
 
-  setStatus("Dashboard ready.", "ok");
+  setStatus(t("status.dashboardReady"), "ok");
 
   setInterval(() => {
     loadState().catch((error) => setStatus(error.message, "bad"));
@@ -864,5 +1437,5 @@ async function boot() {
 }
 
 boot().catch((error) => {
-  setStatus(`Boot failed: ${error.message || "unknown error"}`, "bad");
+  setStatus(t("status.bootFailed", { message: error.message || "unknown error" }), "bad");
 });

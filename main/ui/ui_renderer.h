@@ -12,6 +12,7 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
                                    const local_menu_state_t *menu,
                                    const connectivity_ui_status_t *wifi_status);
 void ui_renderer_draw_dashboard(const dashboard_state_t *state,
-                                bool wifi_connected);
+                                bool wifi_connected,
+                                bool provisioning_portal_active);
 
 #endif
