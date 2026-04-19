@@ -60,6 +60,10 @@ typedef enum {
   WIFI_NOTICE_SAVED_FAIL,
 } wifi_notice_kind_t;
 
+#define GAME_LANE_COUNT 3
+#define GAME_OBSTACLE_COUNT 4
+#define GAME_OBSTACLE_OFFSCREEN_Y 140
+
 static local_menu_state_t s_local_menu = {
     .visible = false,
     .requested_visible = false,
@@ -81,6 +85,14 @@ static local_menu_state_t s_local_menu = {
     .pulse_phase = 0,
     .wifi_notice_kind = WIFI_NOTICE_NONE,
     .wifi_notice_timer = 0,
+    .game_running = false,
+    .game_over = false,
+    .game_player_lane = 1,
+    .game_spawn_timer = 24,
+    .game_score = 0,
+    .game_obstacle_y = {GAME_OBSTACLE_OFFSCREEN_Y, GAME_OBSTACLE_OFFSCREEN_Y,
+                        GAME_OBSTACLE_OFFSCREEN_Y, GAME_OBSTACLE_OFFSCREEN_Y},
+    .game_obstacle_lane = {-1, -1, -1, -1},
 };
 static portMUX_TYPE s_local_menu_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_menu_smoke_demo_started;
@@ -118,6 +130,43 @@ static int wrap_index(int value, int count) {
     value -= count;
   }
   return value;
+}
+
+static void game_reset_locked(void) {
+  s_local_menu.game_running = false;
+  s_local_menu.game_over = false;
+  s_local_menu.game_player_lane = 1;
+  s_local_menu.game_spawn_timer = 24;
+  s_local_menu.game_score = 0;
+  for (int i = 0; i < GAME_OBSTACLE_COUNT; ++i) {
+    s_local_menu.game_obstacle_y[i] = GAME_OBSTACLE_OFFSCREEN_Y;
+    s_local_menu.game_obstacle_lane[i] = -1;
+  }
+}
+
+static void game_start_locked(void) {
+  game_reset_locked();
+  s_local_menu.game_running = true;
+}
+
+static void game_try_spawn_locked(void) {
+  int slot = -1;
+  int lane;
+
+  for (int i = 0; i < GAME_OBSTACLE_COUNT; ++i) {
+    if (s_local_menu.game_obstacle_lane[i] < 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    return;
+  }
+
+  lane = (int)((s_local_menu.pulse_phase + s_local_menu.game_score + slot) %
+               GAME_LANE_COUNT);
+  s_local_menu.game_obstacle_lane[slot] = (int8_t)lane;
+  s_local_menu.game_obstacle_y[slot] = 18;
 }
 
 static int menu_highlight_target_y_q8(int index) {
@@ -169,6 +218,7 @@ void ui_flow_init(void) {
   s_local_menu.pulse_phase = 0;
   s_local_menu.wifi_notice_kind = WIFI_NOTICE_NONE;
   s_local_menu.wifi_notice_timer = 0;
+  game_reset_locked();
   ui_flow_stop_demo_locked();
   portEXIT_CRITICAL(&s_local_menu_lock);
 }
@@ -270,6 +320,10 @@ void ui_flow_handle_encoder_rotate(int steps) {
       s_local_menu.alarm_edit_selected = wrap_index(
           s_local_menu.alarm_edit_selected + steps, ALARM_EDIT_COUNT);
     }
+  } else if (s_local_menu.active_screen == LOCAL_SCREEN_GAME) {
+    int next_lane =
+        clamp_int((int)s_local_menu.game_player_lane + steps, 0, GAME_LANE_COUNT - 1);
+    s_local_menu.game_player_lane = (uint8_t)next_lane;
   }
   portEXIT_CRITICAL(&s_local_menu_lock);
 }
@@ -405,6 +459,14 @@ void ui_flow_handle_encoder_press(void) {
     return;
   }
 
+  if (s_local_menu.active_screen == LOCAL_SCREEN_GAME && !s_local_menu.visible) {
+    if (!s_local_menu.game_running) {
+      game_start_locked();
+      portEXIT_CRITICAL(&s_local_menu_lock);
+      return;
+    }
+  }
+
   if (!s_local_menu.requested_visible) {
     s_local_menu.visible = true;
     s_local_menu.requested_visible = true;
@@ -473,6 +535,44 @@ void ui_flow_tick(void) {
     s_local_menu.wifi_notice_timer--;
     if (s_local_menu.wifi_notice_timer == 0) {
       s_local_menu.wifi_notice_kind = WIFI_NOTICE_NONE;
+    }
+  }
+
+  if (s_local_menu.active_screen == LOCAL_SCREEN_GAME && s_local_menu.game_running &&
+      !s_local_menu.visible && s_local_menu.overlay_progress_q8 == 0) {
+    int player_y = 102;
+    int speed = 3 + (int)(s_local_menu.game_score / 6);
+    if (speed > 6) {
+      speed = 6;
+    }
+
+    if (s_local_menu.game_spawn_timer > 0) {
+      s_local_menu.game_spawn_timer--;
+    } else {
+      game_try_spawn_locked();
+      s_local_menu.game_spawn_timer =
+          (uint8_t)clamp_int(24 - (int)(s_local_menu.game_score / 3), 10, 24);
+    }
+
+    for (int i = 0; i < GAME_OBSTACLE_COUNT; ++i) {
+      if (s_local_menu.game_obstacle_lane[i] < 0) {
+        continue;
+      }
+
+      s_local_menu.game_obstacle_y[i] += speed;
+
+      if (s_local_menu.game_obstacle_lane[i] == (int8_t)s_local_menu.game_player_lane &&
+          s_local_menu.game_obstacle_y[i] >= (player_y - 10) &&
+          s_local_menu.game_obstacle_y[i] <= (player_y + 10)) {
+        s_local_menu.game_running = false;
+        s_local_menu.game_over = true;
+      }
+
+      if (s_local_menu.game_obstacle_y[i] > 118) {
+        s_local_menu.game_obstacle_lane[i] = -1;
+        s_local_menu.game_obstacle_y[i] = GAME_OBSTACLE_OFFSCREEN_Y;
+        s_local_menu.game_score++;
+      }
     }
   }
 

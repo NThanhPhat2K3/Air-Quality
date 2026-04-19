@@ -1157,19 +1157,69 @@ static void draw_alarm_screen(const local_menu_state_t *menu) {
   draw_alarm_editor(menu);
 }
 
-static void draw_game_screen(void) {
-  draw_local_header("GAME HUB", "PLACEHOLDER");
-  draw_panel(6, 34, 148, 26, COLOR_CYAN);
-  fb_draw_text5x7(12, 40, "NEXT STEP", COLOR_MUTED, 1);
-  fb_draw_text5x7(78, 40, "MINI GAME", COLOR_WHITE, 1);
-  fb_draw_text5x7(12, 50, "SNAKE / TAP / REACT", COLOR_CYAN, 1);
-  draw_panel(6, 65, 148, 24, COLOR_ORANGE);
-  fb_draw_text5x7(12, 71, "INPUT", COLOR_MUTED, 1);
-  fb_draw_text5x7(60, 71, "USE BUTTON EVENT", COLOR_WHITE, 1);
-  draw_panel(6, 94, 148, 29, COLOR_LIME);
-  fb_draw_text5x7(12, 100, "STATUS", COLOR_MUTED, 1);
-  fb_draw_text5x7(12, 110, "RESERVED FOR GAME LOOP", COLOR_WHITE, 1);
-  fb_draw_text5x7(12, 118, "SAFE STUB FOR NOW", COLOR_CYAN, 1);
+static void draw_game_screen(const local_menu_state_t *menu) {
+  static const int lane_x[3] = {40, 80, 120};
+  char score_text[20];
+  int road_x = 18;
+  int road_y = 20;
+  int road_w = 124;
+  int road_h = 104;
+  int player_x = lane_x[clamp_int(menu->game_player_lane, 0, 2)];
+  int player_y = 102;
+
+  draw_local_header("LANE RUNNER", "");
+  fb_fill_rect(road_x, road_y, road_w, road_h, RGB565(6, 10, 16));
+  fb_draw_rect(road_x, road_y, road_w, road_h, RGB565(24, 68, 104));
+  fb_draw_rect(road_x + 1, road_y + 1, road_w - 2, road_h - 2, RGB565(10, 26, 42));
+  fb_fill_rect(road_x + 2, road_y + 2, 2, road_h - 4, COLOR_CYAN);
+  fb_fill_rect(road_x + road_w - 4, road_y + 2, 2, road_h - 4, COLOR_CYAN);
+
+  for (int y = road_y + 6; y < road_y + road_h - 8; y += 14) {
+    fb_fill_rect(road_x + 40, y, 2, 8, RGB565(58, 84, 108));
+    fb_fill_rect(road_x + 82, y, 2, 8, RGB565(58, 84, 108));
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    if (menu->game_obstacle_lane[i] < 0 || menu->game_obstacle_lane[i] > 2) {
+      continue;
+    }
+    {
+      int obs_x = lane_x[menu->game_obstacle_lane[i]] - 7;
+      int obs_y = menu->game_obstacle_y[i];
+      fb_fill_rect(obs_x, obs_y, 14, 10, COLOR_ORANGE);
+      fb_draw_rect(obs_x, obs_y, 14, 10, COLOR_YELLOW);
+      fb_fill_rect(obs_x + 2, obs_y + 2, 3, 2, COLOR_WHITE);
+      fb_fill_rect(obs_x + 9, obs_y + 2, 3, 2, COLOR_WHITE);
+    }
+  }
+
+  fb_fill_rect(player_x - 7, player_y, 14, 11, COLOR_CYAN);
+  fb_draw_rect(player_x - 7, player_y, 14, 11, COLOR_WHITE);
+  fb_fill_rect(player_x - 4, player_y - 3, 8, 4, COLOR_WHITE);
+  fb_fill_rect(player_x - 5, player_y + 3, 2, 2, COLOR_BG);
+  fb_fill_rect(player_x + 3, player_y + 3, 2, 2, COLOR_BG);
+
+  snprintf(score_text, sizeof(score_text), "SCORE %u", menu->game_score);
+  fb_fill_rect(8, 8, 52, 10, RGB565(8, 18, 28));
+  fb_draw_rect(8, 8, 52, 10, RGB565(22, 64, 98));
+  fb_draw_text5x7(12, 10, score_text, COLOR_WHITE, 1);
+
+  if (!menu->game_running && !menu->game_over) {
+    fb_fill_rect(24, 46, 112, 28, RGB565(5, 14, 24));
+    fb_draw_rect(24, 46, 112, 28, COLOR_CYAN);
+    fb_draw_text5x7_centered(80, 54, "PRESS TO START", COLOR_WHITE, 1);
+    fb_draw_text5x7_centered(80, 64, "TURN TO MOVE", COLOR_CYAN, 1);
+  } else if (menu->game_over) {
+    fb_fill_rect(26, 44, 108, 32, RGB565(22, 8, 10));
+    fb_draw_rect(26, 44, 108, 32, COLOR_ORANGE);
+    fb_draw_text5x7_centered(80, 52, "GAME OVER", COLOR_WHITE, 1);
+    fb_draw_text5x7_centered(80, 62, "PRESS RETRY", COLOR_ORANGE, 1);
+    fb_draw_text5x7_centered(80, 72, score_text, COLOR_MUTED, 1);
+  } else {
+    fb_fill_rect(108, 8, 42, 10, RGB565(8, 18, 28));
+    fb_draw_rect(108, 8, 42, 10, COLOR_LIME);
+    fb_draw_text5x7(114, 10, "RUN", COLOR_LIME, 1);
+  }
 }
 
 static void draw_memory_screen(void) {
@@ -1241,7 +1291,7 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
     draw_alarm_screen(menu);
     break;
   case LOCAL_SCREEN_GAME:
-    draw_game_screen();
+    draw_game_screen(menu);
     break;
   case LOCAL_SCREEN_MEMORY:
     draw_memory_screen();

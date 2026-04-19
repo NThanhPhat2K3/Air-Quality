@@ -43,6 +43,13 @@ typedef struct {
   uint8_t pulse_phase;
   uint8_t wifi_notice_kind;
   uint16_t wifi_notice_timer;
+  bool game_running;
+  bool game_over;
+  uint8_t game_player_lane;
+  uint8_t game_spawn_timer;
+  uint16_t game_score;
+  int16_t game_obstacle_y[4];
+  int8_t game_obstacle_lane[4];
 } local_menu_state_t;
 
 typedef enum {
