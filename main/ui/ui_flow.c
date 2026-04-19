@@ -10,6 +10,8 @@
 #define UI_FLOW_MENU_SMOKE_STEP_MS 1400
 #define UI_FLOW_MENU_SMOKE_WIFI_HOLD_MS 5000
 #define UI_FLOW_MENU_SMOKE_MONITOR_RETURN_MS 1800
+#define UI_FLOW_OVERLAY_OPEN_STEP_Q8 52
+#define UI_FLOW_OVERLAY_CLOSE_STEP_Q8 44
 #define UI_FLOW_HIGHLIGHT_SNAP_Q8 40
 #define UI_FLOW_HIGHLIGHT_MIN_STEP_Q8 160
 #define UI_FLOW_HIGHLIGHT_MAX_VELOCITY_Q8 3072
@@ -30,10 +32,12 @@ typedef enum {
 
 static local_menu_state_t s_local_menu = {
     .visible = false,
+    .requested_visible = false,
     .active_screen = LOCAL_SCREEN_MONITOR,
     .selected_index = 0,
     .highlight_y_q8 = 0,
     .highlight_velocity_q8 = 0,
+    .overlay_progress_q8 = 0,
     .pulse_phase = 0,
 };
 static portMUX_TYPE s_local_menu_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -69,7 +73,10 @@ static void ui_flow_apply_screen(local_screen_t screen, bool show_menu) {
 
   s_local_menu.active_screen = (local_screen_t)index;
   s_local_menu.selected_index = index;
-  s_local_menu.visible = show_menu;
+  s_local_menu.requested_visible = show_menu;
+  if (show_menu) {
+    s_local_menu.visible = true;
+  }
   if (s_local_menu.highlight_y_q8 == 0 || !show_menu) {
     s_local_menu.highlight_y_q8 = menu_highlight_target_y_q8(index);
     s_local_menu.highlight_velocity_q8 = 0;
@@ -79,10 +86,12 @@ static void ui_flow_apply_screen(local_screen_t screen, bool show_menu) {
 void ui_flow_init(void) {
   portENTER_CRITICAL(&s_local_menu_lock);
   s_local_menu.visible = false;
+  s_local_menu.requested_visible = false;
   s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
   s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
   s_local_menu.highlight_y_q8 = 0;
   s_local_menu.highlight_velocity_q8 = 0;
+  s_local_menu.overlay_progress_q8 = 0;
   s_local_menu.pulse_phase = 0;
   ui_flow_stop_demo_locked();
   portEXIT_CRITICAL(&s_local_menu_lock);
@@ -145,8 +154,9 @@ void ui_flow_handle_encoder_press(void) {
   portENTER_CRITICAL(&s_local_menu_lock);
   ui_flow_stop_demo_locked();
 
-  if (!s_local_menu.visible) {
+  if (!s_local_menu.requested_visible) {
     s_local_menu.visible = true;
+    s_local_menu.requested_visible = true;
     s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
     s_local_menu.highlight_y_q8 =
         menu_highlight_target_y_q8(s_local_menu.selected_index);
@@ -157,17 +167,37 @@ void ui_flow_handle_encoder_press(void) {
 
   s_local_menu.active_screen = (local_screen_t)clamp_int(
       s_local_menu.selected_index, 0, LOCAL_SCREEN_COUNT - 1);
-  s_local_menu.visible = false;
+  s_local_menu.requested_visible = false;
   portEXIT_CRITICAL(&s_local_menu_lock);
 }
 
 void ui_flow_tick(void) {
+  int overlay_target_q8;
   int target_y_q8;
   int diff;
   int spring_q8;
   int next_y_q8;
 
   portENTER_CRITICAL(&s_local_menu_lock);
+  overlay_target_q8 = s_local_menu.requested_visible ? 256 : 0;
+  if (s_local_menu.overlay_progress_q8 != overlay_target_q8) {
+    int overlay_step_q8 = s_local_menu.requested_visible
+                              ? UI_FLOW_OVERLAY_OPEN_STEP_Q8
+                              : UI_FLOW_OVERLAY_CLOSE_STEP_Q8;
+    if (s_local_menu.overlay_progress_q8 < overlay_target_q8) {
+      s_local_menu.overlay_progress_q8 = clamp_int(
+          s_local_menu.overlay_progress_q8 + overlay_step_q8, 0, 256);
+    } else {
+      s_local_menu.overlay_progress_q8 = clamp_int(
+          s_local_menu.overlay_progress_q8 - overlay_step_q8, 0, 256);
+    }
+  }
+  if (!s_local_menu.requested_visible && s_local_menu.overlay_progress_q8 == 0) {
+    s_local_menu.visible = false;
+  } else if (s_local_menu.overlay_progress_q8 > 0) {
+    s_local_menu.visible = true;
+  }
+
   target_y_q8 = menu_highlight_target_y_q8(s_local_menu.selected_index);
   if (s_local_menu.highlight_y_q8 == 0) {
     s_local_menu.highlight_y_q8 = target_y_q8;
@@ -242,7 +272,9 @@ void ui_flow_update_smoke(int aqi) {
       portENTER_CRITICAL(&s_local_menu_lock);
       s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
       s_local_menu.visible = false;
+      s_local_menu.requested_visible = false;
       s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
+      s_local_menu.overlay_progress_q8 = 0;
       portEXIT_CRITICAL(&s_local_menu_lock);
       s_menu_smoke_demo_started = false;
       s_menu_smoke_demo_started_us = 0;
@@ -256,6 +288,8 @@ void ui_flow_update_smoke(int aqi) {
   portENTER_CRITICAL(&s_local_menu_lock);
   s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
   s_local_menu.visible = true;
+  s_local_menu.requested_visible = true;
+  s_local_menu.overlay_progress_q8 = 256;
 
   switch (s_menu_smoke_demo_phase) {
   case MENU_SMOKE_PHASE_MENU_MONITOR:
@@ -268,6 +302,8 @@ void ui_flow_update_smoke(int aqi) {
   case MENU_SMOKE_PHASE_SCREEN_WIFI:
     index = LOCAL_SCREEN_WIFI;
     s_local_menu.visible = false;
+    s_local_menu.requested_visible = false;
+    s_local_menu.overlay_progress_q8 = 0;
     s_local_menu.active_screen = LOCAL_SCREEN_WIFI;
     break;
   case MENU_SMOKE_PHASE_MENU_RETURN_WIFI:
@@ -285,12 +321,16 @@ void ui_flow_update_smoke(int aqi) {
   case MENU_SMOKE_PHASE_SCREEN_MEMORY:
     index = LOCAL_SCREEN_MEMORY;
     s_local_menu.visible = false;
+    s_local_menu.requested_visible = false;
+    s_local_menu.overlay_progress_q8 = 0;
     s_local_menu.active_screen = LOCAL_SCREEN_MEMORY;
     break;
   case MENU_SMOKE_PHASE_RETURN_MONITOR:
   default:
     index = LOCAL_SCREEN_MONITOR;
     s_local_menu.visible = false;
+    s_local_menu.requested_visible = false;
+    s_local_menu.overlay_progress_q8 = 0;
     s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
     break;
   }

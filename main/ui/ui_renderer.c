@@ -975,31 +975,38 @@ static void draw_memory_screen(void) {
 static void draw_menu_overlay(const local_menu_state_t *menu) {
   static const char *kMenuItems[LOCAL_SCREEN_COUNT] = {
       "MONITOR", "WIFI CONFIG", "ALARM", "GAME", "MEMORY"};
+  int progress_q8 = clamp_int(menu->overlay_progress_q8, 0, 256);
+  int y_offset = -(((256 - progress_q8) * (TFT_HEIGHT + 8)) / 256);
   int highlight_y = menu->highlight_y_q8 >> 8;
   int glow_y = highlight_y - 2;
   int pulse = 6 + ((menu->pulse_phase >> 5) & 0x07);
   int indicator_y = highlight_y + 5;
 
-  fb_clear(COLOR_BG);
-  fb_fill_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
-  fb_draw_rect(0, 0, TFT_WIDTH, TFT_HEIGHT, RGB565(14, 44, 74));
-  fb_draw_rect(3, 3, TFT_WIDTH - 6, TFT_HEIGHT - 6, RGB565(8, 26, 42));
-  fb_fill_rect(12, 12, 54, 2, COLOR_CYAN);
-  fb_draw_text5x7(14, 20, "MAIN MENU", COLOR_WHITE, 2);
-  fb_fill_rect(16, glow_y, 128, 20, RGB565(2, 10, 18));
-  fb_fill_rect(17, highlight_y - 1, 126, 18, RGB565(3, 14, 24));
-  fb_fill_rect(18, highlight_y, 124, 16, RGB565(4, 18, 30));
-  fb_draw_rect(18, highlight_y, 124, 16, COLOR_CYAN);
-  fb_draw_rect(19, highlight_y + 1, 122, 14, RGB565(24, 130, 196));
-  fb_fill_rect(18, highlight_y, pulse, 16, COLOR_CYAN);
-  fb_fill_rect(28, indicator_y, 5, 5, COLOR_LIME);
+  if (progress_q8 <= 0) {
+    return;
+  }
+
+  fb_fill_rect(0, y_offset, TFT_WIDTH, TFT_HEIGHT, RGB565(0, 0, 0));
+  fb_draw_rect(0, y_offset, TFT_WIDTH, TFT_HEIGHT, RGB565(14, 44, 74));
+  fb_draw_rect(3, y_offset + 3, TFT_WIDTH - 6, TFT_HEIGHT - 6,
+               RGB565(8, 26, 42));
+  fb_fill_rect(12, y_offset + 12, 54, 2, COLOR_CYAN);
+  fb_draw_text5x7(14, y_offset + 20, "MAIN MENU", COLOR_WHITE, 2);
+  fb_fill_rect(16, y_offset + glow_y, 128, 20, RGB565(2, 10, 18));
+  fb_fill_rect(17, y_offset + highlight_y - 1, 126, 18, RGB565(3, 14, 24));
+  fb_fill_rect(18, y_offset + highlight_y, 124, 16, RGB565(4, 18, 30));
+  fb_draw_rect(18, y_offset + highlight_y, 124, 16, COLOR_CYAN);
+  fb_draw_rect(19, y_offset + highlight_y + 1, 122, 14, RGB565(24, 130, 196));
+  fb_fill_rect(18, y_offset + highlight_y, pulse, 16, COLOR_CYAN);
+  fb_fill_rect(28, y_offset + indicator_y, 5, 5, COLOR_LIME);
 
   for (int i = 0; i < LOCAL_SCREEN_COUNT; ++i) {
     int row_y = 36 + (i * 18);
     int distance = abs((row_y << 8) - menu->highlight_y_q8) >> 8;
     int x_nudge = clamp_int((16 - distance) / 2, 0, 6);
     uint16_t text_color = (distance <= 6) ? COLOR_WHITE : COLOR_MUTED;
-    fb_draw_text5x7(42 + x_nudge, row_y + 4, kMenuItems[i], text_color, 1);
+    fb_draw_text5x7(42 + x_nudge, y_offset + row_y + 4, kMenuItems[i],
+                    text_color, 1);
   }
 }
 
@@ -1029,7 +1036,7 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
     break;
   }
 
-  if (menu->visible) {
+  if (menu->visible || menu->overlay_progress_q8 > 0) {
     draw_menu_overlay(menu);
   }
 }

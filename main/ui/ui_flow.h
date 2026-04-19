@@ -15,10 +15,12 @@ typedef enum {
 
 typedef struct {
   bool visible;
+  bool requested_visible;
   local_screen_t active_screen;
   int selected_index;
   int highlight_y_q8;
   int highlight_velocity_q8;
+  int overlay_progress_q8;
   uint8_t pulse_phase;
 } local_menu_state_t;
 
