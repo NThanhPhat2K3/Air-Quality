@@ -21,6 +21,13 @@ typedef struct {
   bool active;
 } connectivity_saved_network_t;
 
+typedef enum {
+  CONNECTIVITY_SAVED_WIFI_IDLE = 0,
+  CONNECTIVITY_SAVED_WIFI_PENDING,
+  CONNECTIVITY_SAVED_WIFI_SUCCESS,
+  CONNECTIVITY_SAVED_WIFI_FAILED,
+} connectivity_saved_wifi_result_t;
+
 void connectivity_service_setup_and_clock(void);
 bool connectivity_service_is_time_synced(void);
 void connectivity_service_set_time_synced(bool time_synced);
@@ -32,6 +39,8 @@ bool connectivity_service_stop_provisioning(void);
 bool connectivity_service_forget_credentials(void);
 size_t connectivity_service_get_saved_networks(connectivity_saved_network_t *out,
                                               size_t max_items);
-bool connectivity_service_use_saved_network_index(size_t index);
+bool connectivity_service_request_saved_network_index(size_t index);
+bool connectivity_service_poll_saved_network_result(
+    connectivity_saved_wifi_result_t *out_result);
 
 #endif

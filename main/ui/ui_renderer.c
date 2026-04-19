@@ -1009,14 +1009,19 @@ static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
   fb_draw_text(114, 11, portal_active ? "PORTAL" : "RUNTIME", accent, 1);
 
   if (menu->wifi_notice_kind == 1) {
-    notice_text = "SAVED WIFI OK";
+    notice_text = "CONNECTING...";
   } else if (menu->wifi_notice_kind == 2) {
+    notice_text = "SAVED WIFI OK";
+  } else if (menu->wifi_notice_kind == 3) {
     notice_text = "SAVED WIFI FAIL";
   }
   if (notice_text != NULL) {
     int notice_w = text_width(notice_text, 1) + 12;
     int notice_x = (TFT_WIDTH - notice_w) / 2;
-    uint16_t notice_color = menu->wifi_notice_kind == 1 ? COLOR_LIME : COLOR_ORANGE;
+    uint16_t notice_color = menu->wifi_notice_kind == 1
+                                ? COLOR_CYAN
+                                : (menu->wifi_notice_kind == 2 ? COLOR_LIME
+                                                               : COLOR_ORANGE);
     fb_fill_rect(notice_x, 22, notice_w, 10, RGB565(8, 18, 28));
     fb_draw_rect(notice_x, 22, notice_w, 10, notice_color);
     fb_draw_text(notice_x + 6, 24, notice_text, notice_color, 1);

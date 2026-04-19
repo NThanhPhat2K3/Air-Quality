@@ -55,6 +55,7 @@ typedef enum {
 
 typedef enum {
   WIFI_NOTICE_NONE = 0,
+  WIFI_NOTICE_SAVED_CONNECTING,
   WIFI_NOTICE_SAVED_OK,
   WIFI_NOTICE_SAVED_FAIL,
 } wifi_notice_kind_t;
@@ -199,7 +200,7 @@ void ui_flow_dispatch(const ui_flow_event_t *event) {
     ui_flow_apply_screen(LOCAL_SCREEN_MONITOR, false);
     break;
   case UI_FLOW_EVENT_WIFI_NOTICE:
-    s_local_menu.wifi_notice_kind = (uint8_t)clamp_int(event->value, 0, 2);
+    s_local_menu.wifi_notice_kind = (uint8_t)clamp_int(event->value, 0, 3);
     s_local_menu.wifi_notice_timer =
         s_local_menu.wifi_notice_kind == WIFI_NOTICE_NONE
             ? 0

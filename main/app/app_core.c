@@ -25,6 +25,7 @@ void app_core_run(void) {
     encoder_input_event_t encoder_event;
     local_control_action_t control_action;
     int control_value = 0;
+    connectivity_saved_wifi_result_t saved_wifi_result;
 
     if (app_state_machine_is_running(&app_sm) &&
         encoder_input_poll(&encoder_event)) {
@@ -43,13 +44,12 @@ void app_core_run(void) {
         connectivity_service_start_provisioning();
         break;
       case LOCAL_CONTROL_ACTION_USE_SAVED_WIFI:
-        ui_flow_dispatch(&(ui_flow_event_t){
-            .type = UI_FLOW_EVENT_WIFI_NOTICE,
-            .value = connectivity_service_use_saved_network_index(
-                         (size_t)control_value)
-                         ? 1
-                         : 2,
-        });
+        ui_flow_dispatch(&(ui_flow_event_t){.type = UI_FLOW_EVENT_WIFI_NOTICE,
+                                            .value =
+                                                connectivity_service_request_saved_network_index(
+                                                    (size_t)control_value)
+                                                    ? 1
+                                                    : 3});
         break;
       case LOCAL_CONTROL_ACTION_DISCONNECT_WIFI:
         connectivity_service_disconnect_wifi();
@@ -64,6 +64,14 @@ void app_core_run(void) {
       default:
         break;
       }
+    }
+
+    if (app_state_machine_is_running(&app_sm) &&
+        connectivity_service_poll_saved_network_result(&saved_wifi_result)) {
+      ui_flow_dispatch(&(ui_flow_event_t){
+          .type = UI_FLOW_EVENT_WIFI_NOTICE,
+          .value = saved_wifi_result == CONNECTIVITY_SAVED_WIFI_SUCCESS ? 2 : 3,
+      });
     }
 
     app_state_machine_tick(&app_sm);

@@ -102,6 +102,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_wifi_sta_netif;
 static esp_netif_t *s_wifi_ap_netif;
 static TaskHandle_t s_clock_sync_task_handle;
+static TaskHandle_t s_saved_wifi_task_handle;
 static TimerHandle_t s_clock_sync_timer;
 static httpd_handle_t s_config_http_server;
 /*
@@ -126,6 +127,10 @@ static _Atomic int s_wifi_target_missing_cycles;
 static wifi_credentials_t s_wifi_credentials;
 static bool s_wifi_history_loaded;
 static wifi_history_entry_t s_wifi_history[WIFI_HISTORY_MAX_ITEMS];
+static bool s_saved_wifi_request_pending;
+static size_t s_saved_wifi_request_index;
+static connectivity_saved_wifi_result_t s_saved_wifi_result =
+    CONNECTIVITY_SAVED_WIFI_IDLE;
 static char s_provisioning_ap_ssid[33];
 static portMUX_TYPE s_connectivity_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -156,6 +161,7 @@ static void schedule_http_server_recycle(uint32_t delay_ms);
 static void fill_sta_wifi_config(wifi_config_t *wifi_config);
 static void ensure_mdns_service(void);
 static wifi_target_scan_result_t wifi_scan_for_target_ssid(void);
+static void saved_wifi_worker_task(void *arg);
 
 static esp_err_t init_nvs_flash_storage(void) {
   esp_err_t ret = nvs_flash_init();
@@ -2543,6 +2549,74 @@ static void clock_sync_task(void *arg) {
   }
 }
 
+static void saved_wifi_worker_task(void *arg) {
+  (void)arg;
+
+  while (true) {
+    size_t request_index = 0;
+    wifi_history_entry_t entry = {0};
+    bool did_write = false;
+    esp_err_t ret;
+    wifi_test_result_t test;
+
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    portENTER_CRITICAL(&s_connectivity_state_lock);
+    if (!s_saved_wifi_request_pending) {
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      continue;
+    }
+    request_index = s_saved_wifi_request_index;
+    s_saved_wifi_request_pending = false;
+    portEXIT_CRITICAL(&s_connectivity_state_lock);
+
+    if (!wifi_history_get_entry_by_compact_index(request_index, &entry)) {
+      portENTER_CRITICAL(&s_connectivity_state_lock);
+      s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_FAILED;
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      continue;
+    }
+
+    test = wifi_test_credentials(entry.ssid, entry.password, entry.hidden);
+    if (test != WIFI_TEST_RESULT_CONNECTED) {
+      ESP_LOGW(TAG, "Async saved Wi-Fi connect failed for SSID '%s' (reason=%d)",
+               entry.ssid, (int)test);
+      portENTER_CRITICAL(&s_connectivity_state_lock);
+      s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_FAILED;
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      continue;
+    }
+
+    ret = wifi_save_credentials_to_nvs(entry.ssid, entry.password, entry.hidden,
+                                       &did_write);
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "Async saved Wi-Fi save failed for SSID '%s': %s",
+               entry.ssid, esp_err_to_name(ret));
+      portENTER_CRITICAL(&s_connectivity_state_lock);
+      s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_FAILED;
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      continue;
+    }
+
+    if (!did_write) {
+      bool ok = true;
+      if (s_provisioning_portal_active) {
+        ok = stop_provisioning_portal();
+      }
+      portENTER_CRITICAL(&s_connectivity_state_lock);
+      s_saved_wifi_result =
+          ok ? CONNECTIVITY_SAVED_WIFI_SUCCESS : CONNECTIVITY_SAVED_WIFI_FAILED;
+      portEXIT_CRITICAL(&s_connectivity_state_lock);
+      continue;
+    }
+
+    schedule_delayed_restart();
+    portENTER_CRITICAL(&s_connectivity_state_lock);
+    s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_SUCCESS;
+    portEXIT_CRITICAL(&s_connectivity_state_lock);
+  }
+}
+
 void connectivity_service_setup_and_clock(void) {
   if (!wifi_service_init_once()) {
     return;
@@ -2564,6 +2638,16 @@ void connectivity_service_setup_and_clock(void) {
                                       pdFALSE, NULL, clock_sync_timer_callback);
     if (s_clock_sync_timer == NULL) {
       ESP_LOGE(TAG, "Failed to create clock sync timer");
+    }
+  }
+
+  if (s_saved_wifi_task_handle == NULL) {
+    BaseType_t task_ok =
+        xTaskCreate(saved_wifi_worker_task, "saved_wifi", 4096, NULL, 5,
+                    &s_saved_wifi_task_handle);
+    if (task_ok != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create saved Wi-Fi worker task");
+      s_saved_wifi_task_handle = NULL;
     }
   }
 
@@ -2658,40 +2742,50 @@ size_t connectivity_service_get_saved_networks(connectivity_saved_network_t *out
   return count;
 }
 
-bool connectivity_service_use_saved_network_index(size_t index) {
-  wifi_history_entry_t entry = {0};
-  bool did_write = false;
-  esp_err_t ret;
-  wifi_test_result_t test;
+bool connectivity_service_request_saved_network_index(size_t index) {
+  wifi_history_entry_t tmp = {0};
 
-  if (!wifi_history_get_entry_by_compact_index(index, &entry)) {
+  if (s_saved_wifi_task_handle == NULL) {
+    return false;
+  }
+  if (!wifi_history_get_entry_by_compact_index(index, &tmp)) {
     return false;
   }
 
-  test = wifi_test_credentials(entry.ssid, entry.password, entry.hidden);
-  if (test != WIFI_TEST_RESULT_CONNECTED) {
-    ESP_LOGW(TAG, "Local saved Wi-Fi connect failed for SSID '%s' (reason=%d)",
-             entry.ssid, (int)test);
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  if (s_saved_wifi_request_pending ||
+      s_saved_wifi_result == CONNECTIVITY_SAVED_WIFI_PENDING) {
+    portEXIT_CRITICAL(&s_connectivity_state_lock);
+    return false;
+  }
+  s_saved_wifi_request_index = index;
+  s_saved_wifi_request_pending = true;
+  s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_PENDING;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+
+  xTaskNotifyGive(s_saved_wifi_task_handle);
+  return true;
+}
+
+bool connectivity_service_poll_saved_network_result(
+    connectivity_saved_wifi_result_t *out_result) {
+  connectivity_saved_wifi_result_t result;
+
+  if (out_result == NULL) {
     return false;
   }
 
-  ret = wifi_save_credentials_to_nvs(entry.ssid, entry.password, entry.hidden,
-                                     &did_write);
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Local saved Wi-Fi save failed for SSID '%s': %s",
-             entry.ssid, esp_err_to_name(ret));
-    return false;
-  }
-
-  if (!did_write) {
-    if (s_provisioning_portal_active) {
-      return stop_provisioning_portal();
-    }
+  portENTER_CRITICAL(&s_connectivity_state_lock);
+  result = s_saved_wifi_result;
+  if (result == CONNECTIVITY_SAVED_WIFI_SUCCESS ||
+      result == CONNECTIVITY_SAVED_WIFI_FAILED) {
+    s_saved_wifi_result = CONNECTIVITY_SAVED_WIFI_IDLE;
+    portEXIT_CRITICAL(&s_connectivity_state_lock);
+    *out_result = result;
     return true;
   }
-
-  schedule_delayed_restart();
-  return true;
+  portEXIT_CRITICAL(&s_connectivity_state_lock);
+  return false;
 }
 
 void connectivity_service_get_ui_status(connectivity_ui_status_t *out) {
