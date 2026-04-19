@@ -18,6 +18,7 @@ bool connectivity_service_is_time_synced(void);
 void connectivity_service_set_time_synced(bool time_synced);
 bool connectivity_service_is_wifi_connected(void);
 void connectivity_service_get_ui_status(connectivity_ui_status_t *out);
+bool connectivity_service_start_provisioning(void);
 bool connectivity_service_disconnect_wifi(void);
 bool connectivity_service_stop_provisioning(void);
 bool connectivity_service_forget_credentials(void);

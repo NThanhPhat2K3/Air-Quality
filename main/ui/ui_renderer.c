@@ -893,7 +893,44 @@ static void draw_local_header(const char *title, const char *subtitle) {
   fb_draw_text5x7(10, 26, subtitle, COLOR_MUTED, 1);
 }
 
-static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status) {
+static void draw_wifi_action_menu(const local_menu_state_t *menu,
+                                  const connectivity_ui_status_t *wifi_status) {
+  static const char *kActions[] = {
+      "OPEN PORTAL", "DISCONNECT", "STOP PORTAL", "FORGET WIFI", "HOME"};
+  int panel_x = 14;
+  int panel_y = 30;
+  int panel_w = 132;
+  int panel_h = 82;
+  uint16_t accent = wifi_status->provisioning_portal_active
+                        ? COLOR_CYAN
+                        : (wifi_status->connected ? COLOR_LIME : COLOR_ORANGE);
+
+  if (!menu->wifi_actions_visible) {
+    return;
+  }
+
+  fb_fill_rect(panel_x, panel_y, panel_w, panel_h, RGB565(4, 10, 18));
+  fb_draw_rect(panel_x, panel_y, panel_w, panel_h, RGB565(28, 74, 116));
+  fb_draw_rect(panel_x + 2, panel_y + 2, panel_w - 4, panel_h - 4,
+               RGB565(8, 26, 42));
+  fb_fill_rect(panel_x + 8, panel_y + 8, 40, 2, accent);
+  fb_draw_text5x7(panel_x + 10, panel_y + 14, "WIFI ACTIONS", COLOR_WHITE, 1);
+
+  for (int i = 0; i < 5; ++i) {
+    int row_y = panel_y + 24 + (i * 11);
+    bool selected = (i == menu->wifi_action_selected);
+    if (selected) {
+      fb_fill_rect(panel_x + 8, row_y - 1, panel_w - 16, 10, RGB565(8, 24, 38));
+      fb_draw_rect(panel_x + 8, row_y - 1, panel_w - 16, 10, accent);
+      fb_fill_rect(panel_x + 10, row_y + 2, 3, 3, accent);
+    }
+    fb_draw_text5x7(panel_x + 18, row_y + 1, kActions[i],
+                    selected ? COLOR_WHITE : COLOR_MUTED, 1);
+  }
+}
+
+static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
+                             const local_menu_state_t *menu) {
   char ssid_text[40];
   char ip_text[20];
   char ssid_short[40];
@@ -924,6 +961,7 @@ static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status) {
   draw_qr_block(42, 33, 76, url_text);
 
   fb_draw_text5x7_centered(80, 121, ssid_short, RGB565(230, 238, 246), 1);
+  draw_wifi_action_menu(menu, wifi_status);
 }
 
 static void draw_alarm_screen(void) {
@@ -1019,7 +1057,7 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
                         wifi_status->provisioning_portal_active);
     break;
   case LOCAL_SCREEN_WIFI:
-    draw_wifi_screen(wifi_status);
+    draw_wifi_screen(wifi_status, menu);
     break;
   case LOCAL_SCREEN_ALARM:
     draw_alarm_screen();

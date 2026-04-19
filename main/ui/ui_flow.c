@@ -30,11 +30,22 @@ typedef enum {
   MENU_SMOKE_PHASE_COUNT,
 } menu_smoke_phase_t;
 
+typedef enum {
+  WIFI_ACTION_OPEN_PORTAL = 0,
+  WIFI_ACTION_DISCONNECT,
+  WIFI_ACTION_STOP_PORTAL,
+  WIFI_ACTION_FORGET,
+  WIFI_ACTION_HOME,
+  WIFI_ACTION_COUNT,
+} wifi_action_index_t;
+
 static local_menu_state_t s_local_menu = {
     .visible = false,
     .requested_visible = false,
+    .wifi_actions_visible = false,
     .active_screen = LOCAL_SCREEN_MONITOR,
     .selected_index = 0,
+    .wifi_action_selected = 0,
     .highlight_y_q8 = 0,
     .highlight_velocity_q8 = 0,
     .overlay_progress_q8 = 0,
@@ -45,6 +56,8 @@ static bool s_menu_smoke_demo_started;
 static int64_t s_menu_smoke_demo_started_us;
 static menu_smoke_phase_t s_menu_smoke_demo_phase =
     MENU_SMOKE_PHASE_MENU_MONITOR;
+static local_control_action_t s_pending_control_action =
+    LOCAL_CONTROL_ACTION_NONE;
 
 static void ui_flow_stop_demo_locked(void) {
   s_menu_smoke_demo_started = false;
@@ -62,6 +75,19 @@ static int clamp_int(int value, int min_value, int max_value) {
   return value;
 }
 
+static int wrap_index(int value, int count) {
+  if (count <= 0) {
+    return 0;
+  }
+  while (value < 0) {
+    value += count;
+  }
+  while (value >= count) {
+    value -= count;
+  }
+  return value;
+}
+
 static int menu_highlight_target_y_q8(int index) {
   const int row_y[] = {36, 54, 72, 90, 108};
   int safe_index = clamp_int(index, 0, LOCAL_SCREEN_COUNT - 1);
@@ -74,6 +100,8 @@ static void ui_flow_apply_screen(local_screen_t screen, bool show_menu) {
   s_local_menu.active_screen = (local_screen_t)index;
   s_local_menu.selected_index = index;
   s_local_menu.requested_visible = show_menu;
+  s_local_menu.wifi_actions_visible = false;
+  s_local_menu.wifi_action_selected = WIFI_ACTION_OPEN_PORTAL;
   if (show_menu) {
     s_local_menu.visible = true;
   }
@@ -87,8 +115,10 @@ void ui_flow_init(void) {
   portENTER_CRITICAL(&s_local_menu_lock);
   s_local_menu.visible = false;
   s_local_menu.requested_visible = false;
+  s_local_menu.wifi_actions_visible = false;
   s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
   s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
+  s_local_menu.wifi_action_selected = WIFI_ACTION_OPEN_PORTAL;
   s_local_menu.highlight_y_q8 = 0;
   s_local_menu.highlight_velocity_q8 = 0;
   s_local_menu.overlay_progress_q8 = 0;
@@ -146,6 +176,10 @@ void ui_flow_handle_encoder_rotate(int steps) {
         clamp_int(s_local_menu.highlight_velocity_q8 + velocity_kick_q8,
                   -UI_FLOW_HIGHLIGHT_MAX_VELOCITY_Q8,
                   UI_FLOW_HIGHLIGHT_MAX_VELOCITY_Q8);
+  } else if (s_local_menu.active_screen == LOCAL_SCREEN_WIFI &&
+             s_local_menu.wifi_actions_visible) {
+    s_local_menu.wifi_action_selected = wrap_index(
+        s_local_menu.wifi_action_selected + steps, WIFI_ACTION_COUNT);
   }
   portEXIT_CRITICAL(&s_local_menu_lock);
 }
@@ -153,6 +187,37 @@ void ui_flow_handle_encoder_rotate(int steps) {
 void ui_flow_handle_encoder_press(void) {
   portENTER_CRITICAL(&s_local_menu_lock);
   ui_flow_stop_demo_locked();
+
+  if (s_local_menu.active_screen == LOCAL_SCREEN_WIFI && !s_local_menu.visible) {
+    if (!s_local_menu.wifi_actions_visible) {
+      s_local_menu.wifi_actions_visible = true;
+      s_local_menu.wifi_action_selected = WIFI_ACTION_OPEN_PORTAL;
+      portEXIT_CRITICAL(&s_local_menu_lock);
+      return;
+    }
+
+    switch ((wifi_action_index_t)s_local_menu.wifi_action_selected) {
+    case WIFI_ACTION_OPEN_PORTAL:
+      s_pending_control_action = LOCAL_CONTROL_ACTION_START_PORTAL;
+      break;
+    case WIFI_ACTION_DISCONNECT:
+      s_pending_control_action = LOCAL_CONTROL_ACTION_DISCONNECT_WIFI;
+      break;
+    case WIFI_ACTION_STOP_PORTAL:
+      s_pending_control_action = LOCAL_CONTROL_ACTION_STOP_PORTAL;
+      break;
+    case WIFI_ACTION_FORGET:
+      s_pending_control_action = LOCAL_CONTROL_ACTION_FORGET_WIFI;
+      break;
+    case WIFI_ACTION_HOME:
+    default:
+      s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
+      break;
+    }
+    s_local_menu.wifi_actions_visible = false;
+    portEXIT_CRITICAL(&s_local_menu_lock);
+    return;
+  }
 
   if (!s_local_menu.requested_visible) {
     s_local_menu.visible = true;
@@ -169,6 +234,23 @@ void ui_flow_handle_encoder_press(void) {
       s_local_menu.selected_index, 0, LOCAL_SCREEN_COUNT - 1);
   s_local_menu.requested_visible = false;
   portEXIT_CRITICAL(&s_local_menu_lock);
+}
+
+bool ui_flow_take_pending_action(local_control_action_t *out_action) {
+  bool has_action = false;
+
+  if (out_action == NULL) {
+    return false;
+  }
+
+  portENTER_CRITICAL(&s_local_menu_lock);
+  if (s_pending_control_action != LOCAL_CONTROL_ACTION_NONE) {
+    *out_action = s_pending_control_action;
+    s_pending_control_action = LOCAL_CONTROL_ACTION_NONE;
+    has_action = true;
+  }
+  portEXIT_CRITICAL(&s_local_menu_lock);
+  return has_action;
 }
 
 void ui_flow_tick(void) {

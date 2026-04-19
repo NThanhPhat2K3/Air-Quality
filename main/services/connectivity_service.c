@@ -2223,6 +2223,11 @@ void connectivity_service_set_time_synced(bool time_synced) {
   portEXIT_CRITICAL(&s_connectivity_state_lock);
 }
 
+bool connectivity_service_start_provisioning(void) {
+  s_provisioning_auto_opened = false;
+  return start_provisioning_portal();
+}
+
 bool connectivity_service_disconnect_wifi(void) {
   if (connectivity_service_is_wifi_connected()) {
     s_wifi_should_connect = false;

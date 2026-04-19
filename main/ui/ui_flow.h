@@ -13,11 +13,21 @@ typedef enum {
   LOCAL_SCREEN_COUNT,
 } local_screen_t;
 
+typedef enum {
+  LOCAL_CONTROL_ACTION_NONE = 0,
+  LOCAL_CONTROL_ACTION_START_PORTAL,
+  LOCAL_CONTROL_ACTION_DISCONNECT_WIFI,
+  LOCAL_CONTROL_ACTION_STOP_PORTAL,
+  LOCAL_CONTROL_ACTION_FORGET_WIFI,
+} local_control_action_t;
+
 typedef struct {
   bool visible;
   bool requested_visible;
+  bool wifi_actions_visible;
   local_screen_t active_screen;
   int selected_index;
+  int wifi_action_selected;
   int highlight_y_q8;
   int highlight_velocity_q8;
   int overlay_progress_q8;
@@ -43,5 +53,6 @@ void ui_flow_update_smoke(int aqi);
 void ui_flow_dispatch(const ui_flow_event_t *event);
 void ui_flow_handle_encoder_rotate(int steps);
 void ui_flow_handle_encoder_press(void);
+bool ui_flow_take_pending_action(local_control_action_t *out_action);
 
 #endif
