@@ -25,9 +25,15 @@ typedef struct {
   bool visible;
   bool requested_visible;
   bool wifi_actions_visible;
+  bool alarm_editor_visible;
+  bool alarm_edit_adjusting;
   local_screen_t active_screen;
   int selected_index;
   int wifi_action_selected;
+  int alarm_edit_selected;
+  uint8_t alarm_edit_hour;
+  uint8_t alarm_edit_minute;
+  bool alarm_edit_enabled;
   int highlight_y_q8;
   int highlight_velocity_q8;
   int overlay_progress_q8;

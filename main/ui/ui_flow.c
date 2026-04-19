@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 
+#include "alarm_service.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
@@ -39,13 +40,29 @@ typedef enum {
   WIFI_ACTION_COUNT,
 } wifi_action_index_t;
 
+typedef enum {
+  ALARM_EDIT_HOUR = 0,
+  ALARM_EDIT_MINUTE,
+  ALARM_EDIT_ENABLED,
+  ALARM_EDIT_SAVE,
+  ALARM_EDIT_CLEAR,
+  ALARM_EDIT_HOME,
+  ALARM_EDIT_COUNT,
+} alarm_edit_index_t;
+
 static local_menu_state_t s_local_menu = {
     .visible = false,
     .requested_visible = false,
     .wifi_actions_visible = false,
+    .alarm_editor_visible = false,
+    .alarm_edit_adjusting = false,
     .active_screen = LOCAL_SCREEN_MONITOR,
     .selected_index = 0,
     .wifi_action_selected = 0,
+    .alarm_edit_selected = ALARM_EDIT_HOUR,
+    .alarm_edit_hour = 6,
+    .alarm_edit_minute = 30,
+    .alarm_edit_enabled = false,
     .highlight_y_q8 = 0,
     .highlight_velocity_q8 = 0,
     .overlay_progress_q8 = 0,
@@ -101,6 +118,8 @@ static void ui_flow_apply_screen(local_screen_t screen, bool show_menu) {
   s_local_menu.selected_index = index;
   s_local_menu.requested_visible = show_menu;
   s_local_menu.wifi_actions_visible = false;
+  s_local_menu.alarm_editor_visible = false;
+  s_local_menu.alarm_edit_adjusting = false;
   s_local_menu.wifi_action_selected = WIFI_ACTION_OPEN_PORTAL;
   if (show_menu) {
     s_local_menu.visible = true;
@@ -116,9 +135,15 @@ void ui_flow_init(void) {
   s_local_menu.visible = false;
   s_local_menu.requested_visible = false;
   s_local_menu.wifi_actions_visible = false;
+  s_local_menu.alarm_editor_visible = false;
+  s_local_menu.alarm_edit_adjusting = false;
   s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
   s_local_menu.selected_index = LOCAL_SCREEN_MONITOR;
   s_local_menu.wifi_action_selected = WIFI_ACTION_OPEN_PORTAL;
+  s_local_menu.alarm_edit_selected = ALARM_EDIT_HOUR;
+  s_local_menu.alarm_edit_hour = 6;
+  s_local_menu.alarm_edit_minute = 30;
+  s_local_menu.alarm_edit_enabled = false;
   s_local_menu.highlight_y_q8 = 0;
   s_local_menu.highlight_velocity_q8 = 0;
   s_local_menu.overlay_progress_q8 = 0;
@@ -180,11 +205,50 @@ void ui_flow_handle_encoder_rotate(int steps) {
              s_local_menu.wifi_actions_visible) {
     s_local_menu.wifi_action_selected = wrap_index(
         s_local_menu.wifi_action_selected + steps, WIFI_ACTION_COUNT);
+  } else if (s_local_menu.active_screen == LOCAL_SCREEN_ALARM &&
+             s_local_menu.alarm_editor_visible) {
+    if (s_local_menu.alarm_edit_adjusting) {
+      switch ((alarm_edit_index_t)s_local_menu.alarm_edit_selected) {
+      case ALARM_EDIT_HOUR:
+        s_local_menu.alarm_edit_hour =
+            (uint8_t)wrap_index(s_local_menu.alarm_edit_hour + steps, 24);
+        break;
+      case ALARM_EDIT_MINUTE:
+        s_local_menu.alarm_edit_minute =
+            (uint8_t)wrap_index(s_local_menu.alarm_edit_minute + steps, 60);
+        break;
+      case ALARM_EDIT_ENABLED:
+        if (steps != 0) {
+          s_local_menu.alarm_edit_enabled = !s_local_menu.alarm_edit_enabled;
+        }
+        break;
+      case ALARM_EDIT_SAVE:
+      case ALARM_EDIT_CLEAR:
+      case ALARM_EDIT_HOME:
+      default:
+        s_local_menu.alarm_edit_adjusting = false;
+        s_local_menu.alarm_edit_selected = wrap_index(
+            s_local_menu.alarm_edit_selected + steps, ALARM_EDIT_COUNT);
+        break;
+      }
+    } else {
+      s_local_menu.alarm_edit_selected = wrap_index(
+          s_local_menu.alarm_edit_selected + steps, ALARM_EDIT_COUNT);
+    }
   }
   portEXIT_CRITICAL(&s_local_menu_lock);
 }
 
 void ui_flow_handle_encoder_press(void) {
+  alarm_service_state_t alarm_state = {0};
+  bool should_save_alarm = false;
+  bool should_clear_alarm = false;
+  uint8_t save_hour = 6;
+  uint8_t save_minute = 30;
+  bool save_enabled = false;
+
+  alarm_service_get_state(&alarm_state);
+
   portENTER_CRITICAL(&s_local_menu_lock);
   ui_flow_stop_demo_locked();
 
@@ -216,6 +280,69 @@ void ui_flow_handle_encoder_press(void) {
     }
     s_local_menu.wifi_actions_visible = false;
     portEXIT_CRITICAL(&s_local_menu_lock);
+    return;
+  }
+
+  if (s_local_menu.active_screen == LOCAL_SCREEN_ALARM && !s_local_menu.visible) {
+    if (!s_local_menu.alarm_editor_visible) {
+      s_local_menu.alarm_editor_visible = true;
+      s_local_menu.alarm_edit_hour = alarm_state.hour;
+      s_local_menu.alarm_edit_minute = alarm_state.minute;
+      s_local_menu.alarm_edit_enabled = alarm_state.enabled;
+      s_local_menu.alarm_edit_selected = ALARM_EDIT_HOUR;
+      s_local_menu.alarm_edit_adjusting = true;
+      portEXIT_CRITICAL(&s_local_menu_lock);
+      return;
+    }
+
+    if (s_local_menu.alarm_edit_adjusting) {
+      switch ((alarm_edit_index_t)s_local_menu.alarm_edit_selected) {
+      case ALARM_EDIT_HOUR:
+      case ALARM_EDIT_MINUTE:
+      case ALARM_EDIT_ENABLED:
+        s_local_menu.alarm_edit_adjusting = false;
+        portEXIT_CRITICAL(&s_local_menu_lock);
+        return;
+      case ALARM_EDIT_SAVE:
+      case ALARM_EDIT_CLEAR:
+      case ALARM_EDIT_HOME:
+      default:
+        break;
+      }
+    }
+
+    switch ((alarm_edit_index_t)s_local_menu.alarm_edit_selected) {
+    case ALARM_EDIT_HOUR:
+    case ALARM_EDIT_MINUTE:
+    case ALARM_EDIT_ENABLED:
+      s_local_menu.alarm_edit_adjusting = true;
+      break;
+    case ALARM_EDIT_SAVE:
+      save_hour = s_local_menu.alarm_edit_hour;
+      save_minute = s_local_menu.alarm_edit_minute;
+      save_enabled = s_local_menu.alarm_edit_enabled;
+      should_save_alarm = true;
+      s_local_menu.alarm_editor_visible = false;
+      s_local_menu.alarm_edit_adjusting = false;
+      break;
+    case ALARM_EDIT_CLEAR:
+      should_clear_alarm = true;
+      s_local_menu.alarm_editor_visible = false;
+      s_local_menu.alarm_edit_adjusting = false;
+      break;
+    case ALARM_EDIT_HOME:
+    default:
+      s_local_menu.alarm_editor_visible = false;
+      s_local_menu.alarm_edit_adjusting = false;
+      s_local_menu.active_screen = LOCAL_SCREEN_MONITOR;
+      break;
+    }
+    portEXIT_CRITICAL(&s_local_menu_lock);
+    if (should_save_alarm) {
+      alarm_service_save_config(save_hour, save_minute, save_enabled);
+    } else if (should_clear_alarm) {
+      alarm_service_clear();
+    }
     return;
   }
 

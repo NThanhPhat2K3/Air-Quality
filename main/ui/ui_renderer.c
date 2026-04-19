@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 
+#include "alarm_service.h"
 #include "display_hal.h"
 #include "memory_photo_service.h"
 
@@ -964,19 +965,115 @@ static void draw_wifi_screen(const connectivity_ui_status_t *wifi_status,
   draw_wifi_action_menu(menu, wifi_status);
 }
 
-static void draw_alarm_screen(void) {
-  draw_local_header("ALARM PANEL", "SAFE STUB");
-  draw_panel(6, 34, 148, 28, COLOR_ORANGE);
-  fb_draw_text5x7(12, 40, "ALARM 1", COLOR_MUTED, 1);
-  fb_draw_text5x7(88, 40, "06:30", COLOR_WHITE, 1);
-  fb_draw_text5x7(12, 50, "MODE DAILY", COLOR_CYAN, 1);
-  draw_panel(6, 67, 148, 24, COLOR_CYAN);
-  fb_draw_text5x7(12, 73, "ALARM 2", COLOR_MUTED, 1);
-  fb_draw_text5x7(88, 73, "21:00", COLOR_WHITE, 1);
-  fb_draw_text5x7(12, 82, "MODE IDLE", COLOR_MUTED, 1);
-  draw_panel(6, 96, 148, 27, COLOR_LIME);
-  fb_draw_text5x7(12, 102, "NEXT STEP", COLOR_MUTED, 1);
-  fb_draw_text5x7(12, 112, "SYNC WITH REAL RTC", COLOR_WHITE, 1);
+static void draw_alarm_editor(const local_menu_state_t *menu) {
+  static const char *kEditorItems[] = {"HOUR", "MIN", "ARM", "SAVE", "CLEAR",
+                                       "HOME"};
+  char hour_text[4];
+  char minute_text[4];
+  int panel_x = 18;
+  int panel_y = 28;
+  int panel_w = 124;
+  int panel_h = 84;
+
+  if (!menu->alarm_editor_visible) {
+    return;
+  }
+
+  snprintf(hour_text, sizeof(hour_text), "%02d", menu->alarm_edit_hour);
+  snprintf(minute_text, sizeof(minute_text), "%02d", menu->alarm_edit_minute);
+
+  fb_fill_rect(panel_x, panel_y, panel_w, panel_h, RGB565(4, 10, 18));
+  fb_draw_rect(panel_x, panel_y, panel_w, panel_h, RGB565(28, 74, 116));
+  fb_draw_rect(panel_x + 2, panel_y + 2, panel_w - 4, panel_h - 4,
+               RGB565(8, 26, 42));
+  fb_fill_rect(panel_x + 10, panel_y + 8, 34, 2, COLOR_CYAN);
+  fb_draw_text5x7(panel_x + 10, panel_y + 14, "SET ALARM", COLOR_WHITE, 1);
+
+  for (int i = 0; i < 6; ++i) {
+    int row_y = panel_y + 24 + (i * 9);
+    bool selected = (i == menu->alarm_edit_selected);
+    bool adjusting = selected && menu->alarm_edit_adjusting;
+
+    if (selected) {
+      fb_fill_rect(panel_x + 8, row_y - 1, panel_w - 16, 8, RGB565(8, 24, 38));
+      fb_draw_rect(panel_x + 8, row_y - 1, panel_w - 16, 8,
+                   adjusting ? COLOR_ORANGE : COLOR_CYAN);
+    }
+
+    fb_draw_text5x7(panel_x + 12, row_y, kEditorItems[i],
+                    selected ? COLOR_WHITE : COLOR_MUTED, 1);
+
+    switch (i) {
+    case 0:
+      fb_draw_text5x7(panel_x + 92, row_y, hour_text,
+                      adjusting ? COLOR_ORANGE : COLOR_WHITE, 1);
+      break;
+    case 1:
+      fb_draw_text5x7(panel_x + 92, row_y, minute_text,
+                      adjusting ? COLOR_ORANGE : COLOR_WHITE, 1);
+      break;
+    case 2:
+      fb_draw_text5x7(panel_x + 86, row_y,
+                      menu->alarm_edit_enabled ? "ON" : "OFF",
+                      adjusting ? COLOR_ORANGE : COLOR_CYAN, 1);
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+static void draw_alarm_screen(const local_menu_state_t *menu) {
+  alarm_service_state_t alarm = {0};
+  char time_text[8];
+  alarm_service_get_state(&alarm);
+
+  draw_local_header("ALARM", "");
+
+  fb_fill_circle(20, 108, 18, RGB565(8, 12, 20));
+  fb_fill_circle(142, 34, 16, RGB565(8, 14, 24));
+  fb_fill_circle(126, 110, 22, RGB565(6, 10, 18));
+
+  fb_fill_rect(10, 30, 140, 56, RGB565(4, 10, 18));
+  fb_draw_rect(10, 30, 140, 56, RGB565(22, 62, 98));
+  fb_draw_rect(12, 32, 136, 52, RGB565(8, 22, 36));
+  fb_fill_rect(18, 38, 32, 2, alarm.ringing ? COLOR_RED : COLOR_ORANGE);
+  fb_draw_text5x7(18, 46, "LOCAL ALARM", COLOR_MUTED, 1);
+  if (alarm.configured) {
+    snprintf(time_text, sizeof(time_text), "%02d:%02d", alarm.hour,
+             alarm.minute);
+    fb_draw_text(24, 56, time_text, COLOR_WHITE, 3);
+  } else {
+    fb_draw_text(24, 56, "--:--", COLOR_WHITE, 3);
+  }
+  fb_fill_rect(104, 42, 30, 10, RGB565(10, 20, 32));
+  fb_draw_rect(104, 42, 30, 10, alarm.enabled ? COLOR_ORANGE : COLOR_DIVIDER);
+  fb_fill_circle(110, 47, 1, alarm.enabled ? COLOR_ORANGE : COLOR_MUTED);
+  fb_draw_text(115, 45, alarm.enabled ? "ARM" : "OFF",
+               alarm.enabled ? COLOR_ORANGE : COLOR_MUTED, 1);
+  fb_draw_text5x7(18, 74,
+                  alarm.ringing ? "ALARM ACTIVE NOW"
+                                : (alarm.configured ? "PRESS TO EDIT"
+                                                    : "PRESS TO CREATE"),
+                  alarm.ringing ? COLOR_RED : RGB565(208, 220, 232), 1);
+
+  fb_fill_rect(10, 92, 140, 20, RGB565(4, 10, 18));
+  fb_draw_rect(10, 92, 140, 20, RGB565(18, 54, 84));
+  fb_fill_rect(18, 100, 18, 2, COLOR_CYAN);
+  fb_draw_text5x7(18, 97, "READY", COLOR_MUTED, 1);
+  fb_draw_text5x7(58, 97,
+                  alarm.ringing ? "RINGING"
+                                : (alarm.enabled ? "ARMED" : "PRESS EDIT"),
+                  alarm.ringing ? COLOR_RED
+                                : (alarm.enabled ? COLOR_LIME : COLOR_CYAN),
+                  1);
+
+  fb_fill_rect(10, 116, 140, 7, RGB565(3, 8, 14));
+  fb_fill_rect(11, 117, 48, 5, alarm.enabled ? COLOR_ORANGE : RGB565(24, 38, 54));
+  fb_fill_rect(61, 117, 20, 5, RGB565(24, 38, 54));
+  fb_fill_rect(83, 117, 14, 5, RGB565(20, 32, 48));
+
+  draw_alarm_editor(menu);
 }
 
 static void draw_game_screen(void) {
@@ -1060,7 +1157,7 @@ void ui_renderer_draw_local_screen(const dashboard_state_t *state,
     draw_wifi_screen(wifi_status, menu);
     break;
   case LOCAL_SCREEN_ALARM:
-    draw_alarm_screen();
+    draw_alarm_screen(menu);
     break;
   case LOCAL_SCREEN_GAME:
     draw_game_screen();

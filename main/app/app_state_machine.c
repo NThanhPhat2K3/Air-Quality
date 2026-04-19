@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "alarm_service.h"
 #include "display_hal.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -63,6 +64,7 @@ static void app_enter_boot_phase(app_state_machine_t *sm, int percent,
 static void app_enter_running_phase(app_state_machine_t *sm) {
   (void)sm;
   app_dashboard_refresh(sm, true);
+  alarm_service_restore_from_nvs();
   ui_flow_init();
 }
 
@@ -154,6 +156,7 @@ void app_state_machine_tick(app_state_machine_t *sm) {
     }
 
     app_dashboard_refresh(sm, false);
+    alarm_service_sync_clock(&sm->dashboard.clock);
     ui_flow_update_smoke(sm->dashboard.aqi);
     ui_flow_tick();
     connectivity_service_get_ui_status(&sm->wifi_status);
