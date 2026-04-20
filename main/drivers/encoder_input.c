@@ -7,17 +7,45 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
-/* KY-040: CLK, DT, SW. Change these three pins if your wiring differs. */
+/*
+ * Encoder wiring: KY-040 uses CLK/DT/SW, while many EC11 modules expose the
+ * same signals as A/B/KO (or PUSH). Change only the pin macros if needed.
+ */
 #define ENCODER_PIN_CLK 25
 #define ENCODER_PIN_DT 26
 #define ENCODER_PIN_SW 27
 #define ENCODER_DIRECTION_SIGN 1
 
+#define ENCODER_PROFILE_LEGACY_MODULE 0
+#define ENCODER_PROFILE_EC11_MODULE 1
+
+/*
+ * Pick the decoder profile here:
+ * - ENCODER_PROFILE_EC11_MODULE: balanced for EC11 modules
+ * - ENCODER_PROFILE_LEGACY_MODULE: more responsive for older modules
+ */
+#define ENCODER_INPUT_PROFILE ENCODER_PROFILE_EC11_MODULE
+
+#if ENCODER_INPUT_PROFILE == ENCODER_PROFILE_LEGACY_MODULE
+#define ENCODER_STEP_LATCH 2
+#define ENCODER_MAX_STEPS_PER_POLL 2
+#elif ENCODER_INPUT_PROFILE == ENCODER_PROFILE_EC11_MODULE
+/*
+ * Many EC11 modules expose only two stable transitions per detent, so using a
+ * full 4-edge latch can make end-of-menu items feel unreachable.
+ */
+#define ENCODER_STEP_LATCH 2
+#define ENCODER_MAX_STEPS_PER_POLL 1
+#else
+#error "Unsupported ENCODER_INPUT_PROFILE"
+#endif
+
 #define ENCODER_BUTTON_DEBOUNCE_POLLS 2
 
 typedef struct {
   volatile int pending_steps;
-  int last_clk_level;
+  int8_t transition_accumulator;
+  uint8_t last_ab_state;
   int raw_button_level;
   int stable_button_level;
   uint8_t button_stable_polls;
@@ -32,22 +60,52 @@ static inline int encoder_read_level(int pin) {
   return gpio_get_level((gpio_num_t)pin);
 }
 
-static void IRAM_ATTR encoder_clk_isr(void *arg) {
-  int clk_level;
-  int dt_level;
+static inline uint8_t encoder_read_ab_state(void) {
+  return (uint8_t)((encoder_read_level(ENCODER_PIN_CLK) << 1) |
+                   encoder_read_level(ENCODER_PIN_DT));
+}
+
+static inline int8_t IRAM_ATTR encoder_transition_delta(uint8_t previous_state,
+                                                        uint8_t current_state) {
+  switch ((previous_state << 2) | current_state) {
+  case 0b0001:
+  case 0b0111:
+  case 0b1110:
+  case 0b1000:
+    return 1;
+  case 0b0010:
+  case 0b1011:
+  case 0b1101:
+  case 0b0100:
+    return -1;
+  default:
+    return 0;
+  }
+}
+
+static void IRAM_ATTR encoder_ab_isr(void *arg) {
+  uint8_t current_state;
+  int8_t delta;
 
   (void)arg;
 
-  clk_level = gpio_get_level((gpio_num_t)ENCODER_PIN_CLK);
-  dt_level = gpio_get_level((gpio_num_t)ENCODER_PIN_DT);
+  current_state = encoder_read_ab_state();
 
   portENTER_CRITICAL_ISR(&s_encoder_lock);
-  if (clk_level != s_encoder_state.last_clk_level) {
-    s_encoder_state.last_clk_level = clk_level;
-    if (clk_level == 0) {
-      s_encoder_state.pending_steps +=
-          (dt_level != 0) ? ENCODER_DIRECTION_SIGN : -ENCODER_DIRECTION_SIGN;
+  delta = encoder_transition_delta(s_encoder_state.last_ab_state, current_state);
+  if (delta != 0) {
+    s_encoder_state.transition_accumulator += delta;
+    s_encoder_state.last_ab_state = current_state;
+
+    if (s_encoder_state.transition_accumulator >= ENCODER_STEP_LATCH) {
+      s_encoder_state.pending_steps += ENCODER_DIRECTION_SIGN;
+      s_encoder_state.transition_accumulator -= ENCODER_STEP_LATCH;
+    } else if (s_encoder_state.transition_accumulator <= -ENCODER_STEP_LATCH) {
+      s_encoder_state.pending_steps -= ENCODER_DIRECTION_SIGN;
+      s_encoder_state.transition_accumulator += ENCODER_STEP_LATCH;
     }
+  } else {
+    s_encoder_state.last_ab_state = current_state;
   }
   portEXIT_CRITICAL_ISR(&s_encoder_lock);
 }
@@ -65,7 +123,7 @@ void encoder_input_init(void) {
   memset(&s_encoder_state, 0, sizeof(s_encoder_state));
   ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-  s_encoder_state.last_clk_level = encoder_read_level(ENCODER_PIN_CLK);
+  s_encoder_state.last_ab_state = encoder_read_ab_state();
   s_encoder_state.raw_button_level = encoder_read_level(ENCODER_PIN_SW);
   s_encoder_state.stable_button_level = s_encoder_state.raw_button_level;
 
@@ -81,7 +139,11 @@ void encoder_input_init(void) {
   ESP_ERROR_CHECK(gpio_set_intr_type((gpio_num_t)ENCODER_PIN_CLK,
                                      GPIO_INTR_ANYEDGE));
   ESP_ERROR_CHECK(
-      gpio_isr_handler_add((gpio_num_t)ENCODER_PIN_CLK, encoder_clk_isr, NULL));
+      gpio_set_intr_type((gpio_num_t)ENCODER_PIN_DT, GPIO_INTR_ANYEDGE));
+  ESP_ERROR_CHECK(
+      gpio_isr_handler_add((gpio_num_t)ENCODER_PIN_CLK, encoder_ab_isr, NULL));
+  ESP_ERROR_CHECK(
+      gpio_isr_handler_add((gpio_num_t)ENCODER_PIN_DT, encoder_ab_isr, NULL));
 }
 
 bool encoder_input_poll(encoder_input_event_t *event) {
@@ -95,8 +157,16 @@ bool encoder_input_poll(encoder_input_event_t *event) {
   event->button_pressed = false;
 
   portENTER_CRITICAL(&s_encoder_lock);
-  event->steps = s_encoder_state.pending_steps;
-  s_encoder_state.pending_steps = 0;
+  if (s_encoder_state.pending_steps > ENCODER_MAX_STEPS_PER_POLL) {
+    event->steps = ENCODER_MAX_STEPS_PER_POLL;
+    s_encoder_state.pending_steps -= ENCODER_MAX_STEPS_PER_POLL;
+  } else if (s_encoder_state.pending_steps < -ENCODER_MAX_STEPS_PER_POLL) {
+    event->steps = -ENCODER_MAX_STEPS_PER_POLL;
+    s_encoder_state.pending_steps += ENCODER_MAX_STEPS_PER_POLL;
+  } else {
+    event->steps = s_encoder_state.pending_steps;
+    s_encoder_state.pending_steps = 0;
+  }
   portEXIT_CRITICAL(&s_encoder_lock);
 
   raw_button_level = encoder_read_level(ENCODER_PIN_SW);
